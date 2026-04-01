@@ -1,0 +1,13 @@
+{
+  "llm_api_url": "https://backend.buildpicoapps.com/aero/run/llm-api?pk=v1-Z0FBQUFBQm5IZkJDMlNyYUVUTjIyZVN3UWFNX3BFTU85SWpCM2NUMUk3T2dxejhLSzBhNWNMMXNzZlp3c09BSTR6YW1Sc1BmdGNTVk1GY0liT1RoWDZZX1lNZlZ0Z1dqd3c9PQ==",
+  "image_api_url": "https://backend.buildpicoapps.com/aero/run/image-generation-api?pk=v1-Z0FBQUFBQm5IZkJDMlNyYUVUTjIyZVN3UWFNX3BFTU85SWpCM2NUMUk3T2dxejhLSzBhNWNMMXNzZlp3c09BSTR6YW1Sc1BmdGNTVk1GY0liT1RoWDZZX1lNZlZ0Z1dqd3c9PQ==",
+  "max_tokens": 2048,
+  "temperature": 0.7,
+  "system_prompt": "You are KinyaBot, a helpful AI assistant.",
+  "image_gen_enabled": true,
+  "file_uploads_enabled": true,
+  "maintenance_mode": false,
+  "app_name": "KinyaBot AI",
+  "max_context_messages": 10,
+  "blocked_ips": []
+}
