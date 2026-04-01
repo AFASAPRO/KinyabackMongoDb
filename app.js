@@ -50,7 +50,7 @@ async function connectDB() {
 
 /* ── CORS ──────────────────────────────────────────────────────── */
 const allowedOrigins = [
-  "https://kinyafront-mongo-db.vercel.app",
+  "https://kinyabotai.vercel.app/",
   "https://backendkiny1.onrender.com",
   "http://localhost:5173",
   "http://localhost:3000"
