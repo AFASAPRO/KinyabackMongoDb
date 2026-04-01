@@ -50,25 +50,25 @@ async function connectDB() {
 
 /* ── CORS ──────────────────────────────────────────────────────── */
 const allowedOrigins = [
-  "https://kinyabotai.vercel.app/",
-  "https://backendkiny1.onrender.com",
+  "https://kinyabotai.vercel.app",
   "http://localhost:5173",
   "http://localhost:3000"
 ];
 
 app.use(cors({
   origin: function (origin, callback) {
-    if (!origin) return callback(null, true); // allow mobile apps / curl
+    if (!origin) return callback(null, true);
 
     if (allowedOrigins.includes(origin)) {
-      callback(null, true);
+      return callback(null, true);
     } else {
-      callback(new Error("Not allowed by CORS"));
+      return callback(new Error("Not allowed by CORS"));
     }
   },
   credentials: true
 }));
 
+// ✅ THIS LINE FIXES YOUR ERROR
 app.options("*", cors());
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ extended: true, limit: '100mb' }));
