@@ -14,8 +14,8 @@ const fs         = require('fs');
 const path       = require('path');
 const crypto     = require('crypto');
 const nodemailer = require('nodemailer');
-const FormData   = require('form-data');
 const admin      = require('firebase-admin');
+const { complete: completeWithGroq, DEFAULT_MODEL } = require('./ai-service');
 
 const {
   User, Chat, Message, Admin, Notification, PageView,
@@ -27,8 +27,6 @@ const {
 if (!admin.apps.length) {
   admin.initializeApp({ projectId: process.env.FIREBASE_PROJECT_ID || 'kinyabot-92ad1' });
 }
-
-const fetch = (...a) => import('node-fetch').then(({ default: f }) => f(...a));
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
@@ -96,8 +94,6 @@ app.use('/uploads', express.static('uploads'));
 /* ── SETTINGS ────────────────────────────────────────────────── */
 const SETTINGS_FILE = './admin-settings.json';
 let cfg = {
-  llm_api_url: process.env.LLM_API_URL || '',
-  image_api_url: process.env.IMAGE_API_URL || '',
   max_tokens: 2048, temperature: 0.7, max_context_messages: 10,
   system_prompt: 'You are KinyaBot, a helpful AI assistant. Be concise, friendly, and accurate.',
   image_gen_enabled: true, file_uploads_enabled: true,
@@ -159,6 +155,14 @@ app.use((req, res, next) => {
 /* ── HELPERS ─────────────────────────────────────────────────── */
 function friendlyError(err) {
   const msg = String(err?.message || err || '');
+  if (err?.code === 'GROQ_NOT_CONFIGURED')
+    return 'KinyaBot AI is not configured yet. Please contact the administrator.';
+  if (err?.status === 401 || msg.includes('401'))
+    return 'KinyaBot AI is temporarily unavailable. Please contact the administrator.';
+  if (err?.status === 429 || msg.includes('429') || msg.toLowerCase().includes('rate limit'))
+    return 'KinyaBot is busy right now. Please wait a moment and try again.';
+  if (err?.code === 'INVALID_CONVERSATION' || err?.code === 'EMPTY_AI_RESPONSE')
+    return 'KinyaBot could not process that conversation. Please try again.';
   if (msg.includes('ENOTFOUND') || msg.includes('getaddrinfo') || msg.includes('ECONNREFUSED'))
     return "Couldn't reach the AI service. Please check your internet connection and try again.";
   if (msg.includes('timeout') || msg.includes('ETIMEDOUT'))
@@ -550,54 +554,25 @@ app.post('/api/chats/:id/messages/stream', authGuard, upload.single('file'), asy
       await chat.save();
     }
 
-    // Build context
+    // Build context for the centralized Groq service.
     const history = await Message.find({ chat_id: chatId }).sort({ created_at: 1 }).limit(cfg.max_context_messages).lean();
     const memory = await getUserMemory(req.user.id);
-    const memoryContext = Object.keys(memory).length
-      ? `User context: ${Object.entries(memory).map(([k, v]) => `${k}=${v}`).join(', ')}\n\n`
-      : '';
     const ragContext = cfg.knowledge_base_enabled && content ? await searchKnowledgeBase(content) : '';
-
-    let prompt = '';
-    if (cfg.system_prompt) prompt += cfg.system_prompt + '\n\n';
-    if (memoryContext) prompt += memoryContext;
-    if (history.length > 1) {
-      const ctx = history.slice(0, -1).map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n');
-      prompt += `Previous conversation:\n${ctx}\n\n`;
-    }
-
-    let fileContent = '';
+    let fileContext = '';
     if (req.file) {
       const text = extractTextFromFile(req.file.path);
-      if (text) fileContent = `\n\n[Attached file: ${req.file.originalname}]\n${text}`;
-    }
-    prompt += `User: ${content || '[file only]'}${fileContent}${ragContext}`;
-
-    const isImage = (content || '').trim().toLowerCase().startsWith('/image');
-    const apiUrl = isImage ? cfg.image_api_url : cfg.llm_api_url;
-    if (!apiUrl) {
-      send('error', { message: 'AI service is not configured. Please contact the administrator.' });
-      return res.end();
+      if (text) fileContext = `[Attached file: ${req.file.originalname}]\n${text}`;
     }
 
     let aiText = '';
     try {
-      let aiResponse;
-      if (req.file && !isImage) {
-        const fd = new FormData();
-        fd.append('prompt', prompt);
-        fd.append('file', fs.createReadStream(req.file.path), req.file.originalname);
-        const r = await fetch(apiUrl, { method: 'POST', body: fd, headers: fd.getHeaders() });
-        aiResponse = await r.json();
-      } else {
-        const r = await fetch(apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt }) });
-        aiResponse = await r.json();
-      }
-      if (aiResponse.status !== 'success') throw new Error('API_ERROR');
-      aiText = (aiResponse.text || '').trim();
+      aiText = (await completeWithGroq({
+        history, systemPrompt: cfg.system_prompt, memory, ragContext, fileContext,
+        maxTokens: cfg.max_tokens, temperature: cfg.temperature
+      })).text;
     } catch (err) {
       send('error', { message: friendlyError(err) });
-      await trackUsage(req.user.id, chatId, 0, isImage ? 'image' : 'chat', Date.now() - startTime, false);
+      await trackUsage(req.user.id, chatId, 0, 'chat', Date.now() - startTime, false);
       return res.end();
     }
 
@@ -615,8 +590,8 @@ app.post('/api/chats/:id/messages/stream', authGuard, upload.single('file'), asy
     chat.updated_at = new Date();
     await chat.save();
 
-    const tokens = estimateTokens(prompt + aiText);
-    await trackUsage(req.user.id, chatId, tokens, isImage ? 'image' : 'chat', Date.now() - startTime, true);
+    const tokens = estimateTokens(history.map(message => message.content).join('\n') + aiText);
+    await trackUsage(req.user.id, chatId, tokens, 'chat', Date.now() - startTime, true);
     await extractMemoryFromConversation(req.user.id, content || '', aiText);
 
     const io = req.app.get('io');
@@ -660,39 +635,19 @@ app.post('/api/chats/:id/messages', authGuard, upload.single('file'), async (req
 
     const history = await Message.find({ chat_id: chatId }).sort({ created_at: 1 }).limit(cfg.max_context_messages).lean();
     const memory = await getUserMemory(req.user.id);
-    const memCtx = Object.keys(memory).length ? `User context: ${Object.entries(memory).map(([k, v]) => `${k}=${v}`).join(', ')}\n\n` : '';
     const ragCtx = cfg.knowledge_base_enabled && content ? await searchKnowledgeBase(content) : '';
-
-    let prompt = (cfg.system_prompt || '') + '\n\n' + memCtx;
-    if (history.length > 1) {
-      const ctx = history.slice(0, -1).map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n');
-      prompt += `Previous conversation:\n${ctx}\n\n`;
-    }
+    let fileContext = '';
     if (req.file) {
       const text = extractTextFromFile(req.file.path);
-      if (text) prompt += `[Attached: ${req.file.originalname}]\n${text}\n\n`;
+      if (text) fileContext = `[Attached: ${req.file.originalname}]\n${text}`;
     }
-    prompt += `User: ${content || '[file only]'}${ragCtx}`;
-
-    const isImage = (content || '').trim().toLowerCase().startsWith('/image');
-    const apiUrl = isImage ? cfg.image_api_url : cfg.llm_api_url;
-    if (!apiUrl) return res.status(503).json({ error: 'AI service is not configured.' });
 
     let aiText;
     try {
-      let aiResponse;
-      if (req.file) {
-        const fd = new FormData();
-        fd.append('prompt', prompt);
-        fd.append('file', fs.createReadStream(req.file.path), req.file.originalname);
-        const r = await fetch(apiUrl, { method: 'POST', body: fd, headers: fd.getHeaders() });
-        aiResponse = await r.json();
-      } else {
-        const r = await fetch(apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt }) });
-        aiResponse = await r.json();
-      }
-      if (aiResponse.status !== 'success') throw new Error('API_ERROR');
-      aiText = (aiResponse.text || '').trim();
+      aiText = (await completeWithGroq({
+        history, systemPrompt: cfg.system_prompt, memory, ragContext: ragCtx, fileContext,
+        maxTokens: cfg.max_tokens, temperature: cfg.temperature
+      })).text;
     } catch (err) {
       await trackUsage(req.user.id, chatId, 0, 'chat', Date.now() - startTime, false);
       return res.status(503).json({ error: friendlyError(err) });
@@ -702,8 +657,8 @@ app.post('/api/chats/:id/messages', authGuard, upload.single('file'), async (req
     chat.updated_at = new Date();
     await chat.save();
 
-    const tokens = estimateTokens(prompt + aiText);
-    await trackUsage(req.user.id, chatId, tokens, isImage ? 'image' : 'chat', Date.now() - startTime, true);
+    const tokens = estimateTokens(history.map(message => message.content).join('\n') + aiText);
+    await trackUsage(req.user.id, chatId, tokens, 'chat', Date.now() - startTime, true);
     await extractMemoryFromConversation(req.user.id, content || '', aiText);
 
     const io = req.app.get('io');
@@ -1076,15 +1031,25 @@ app.delete('/api/admin/notifications/:id', adminGuard, async (req, res) => {
 });
 
 /* ── SETTINGS ────────────────────────────────────────────────── */
-app.get('/api/admin/settings', adminGuard, (_, res) => res.json(cfg));
+app.get('/api/admin/settings', adminGuard, (_, res) => res.json({ ...cfg, groq_model: process.env.GROQ_MODEL || DEFAULT_MODEL }));
 app.put('/api/admin/settings', adminGuard, async (req, res) => {
   try {
-    cfg = { ...cfg, ...req.body };
+    const allowedSettings = [
+      'max_tokens', 'temperature', 'system_prompt', 'image_gen_enabled',
+      'file_uploads_enabled', 'maintenance_mode', 'app_name', 'max_context_messages',
+      'blocked_ips', 'cost_per_1k_tokens', 'free_daily_limit', 'premium_daily_limit',
+      'moderation_enabled', 'knowledge_base_enabled'
+    ];
+    const safeSettings = Object.fromEntries(
+      allowedSettings.filter(key => Object.prototype.hasOwnProperty.call(req.body, key))
+        .map(key => [key, req.body[key]])
+    );
+    cfg = { ...cfg, ...safeSettings };
     saveCfg();
     await sysLog('info', 'admin', `Settings updated by ${req.admin.username}`);
     const io = req.app.get('io');
     if (io && req.body.maintenance_mode !== undefined) io.emit('maintenance_mode', { active: req.body.maintenance_mode });
-    res.json({ success: true, settings: cfg });
+    res.json({ success: true, settings: { ...cfg, groq_model: process.env.GROQ_MODEL || DEFAULT_MODEL } });
   } catch { res.status(500).json({ error: 'Failed to save settings' }); }
 });
 
@@ -1293,15 +1258,17 @@ app.get('/api/admin/export/chats', adminGuard, async (req, res) => {
 
 /* ── AI TEST PANEL ───────────────────────────────────────────── */
 app.post('/api/admin/ai/test', adminGuard, async (req, res) => {
-  const { prompt, model_url } = req.body;
+  const { prompt } = req.body;
   if (!prompt) return res.status(400).json({ error: 'Prompt required' });
   const start = Date.now();
   try {
-    const apiUrl = model_url || cfg.llm_api_url;
-    if (!apiUrl) return res.status(400).json({ error: 'No API URL configured' });
-    const r = await fetch(apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt }) });
-    const data = await r.json();
-    res.json({ response: data.text || data, response_ms: Date.now() - start, status: data.status });
+    const data = await completeWithGroq({
+      history: [{ role: 'user', content: prompt }],
+      systemPrompt: cfg.system_prompt,
+      maxTokens: cfg.max_tokens,
+      temperature: cfg.temperature
+    });
+    res.json({ response: data.text, model: data.model, response_ms: Date.now() - start, status: 'success' });
   } catch (err) { res.status(503).json({ error: friendlyError(err), response_ms: Date.now() - start }); }
 });
 
