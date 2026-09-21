@@ -1,65 +1,59 @@
-const Groq = require('groq-sdk');
+/**
+ * KinyaBot — Legacy AI service entry (backward-compatible shim)
+ * ─────────────────────────────────────────────────────────────
+ * The real implementation now lives in services/ai/ (AI Core):
+ *   groqProvider  – single Groq integration point
+ *   chatService   – context management / prompt assembly
+ *   documentService / speechService – multimodal capabilities
+ *
+ * This module keeps the historical `complete()` / `buildMessages()`
+ * API so existing callers (admin AI test panel) keep working while
+ * new code should use the AI Core services directly.
+ */
+const provider = require('./services/ai/groqProvider')
+const config = require('./services/ai/config')
 
-const DEFAULT_MODEL = 'llama-3.3-70b-versatile';
-
-let client;
-
-function getClient() {
-  if (!process.env.GROQ_API_KEY) {
-    const error = new Error('GROQ_NOT_CONFIGURED');
-    error.code = 'GROQ_NOT_CONFIGURED';
-    throw error;
-  }
-  if (!client) client = new Groq({ apiKey: process.env.GROQ_API_KEY });
-  return client;
-}
+const DEFAULT_MODEL = provider.DEFAULT_MODEL
 
 function buildMessages({ history, systemPrompt, memory, ragContext, fileContext }) {
-  const context = [];
+  const context = []
   if (memory && Object.keys(memory).length) {
-    context.push(`User context: ${Object.entries(memory).map(([key, value]) => `${key}=${value}`).join(', ')}`);
+    context.push(`User context: ${Object.entries(memory).map(([key, value]) => `${key}=${value}`).join(', ')}`)
   }
-  if (ragContext) context.push(ragContext.trim());
-  if (fileContext) context.push(fileContext.trim());
+  if (ragContext) context.push(ragContext.trim())
+  if (fileContext) context.push(fileContext.trim())
 
-  const messages = [];
-  if (systemPrompt) messages.push({ role: 'system', content: systemPrompt.trim() });
+  const messages = []
+  if (systemPrompt) messages.push({ role: 'system', content: systemPrompt.trim() })
 
   for (const message of history || []) {
-    if (!['user', 'assistant'].includes(message.role) || !message.content?.trim()) continue;
-    messages.push({ role: message.role, content: message.content.trim() });
+    if (!['user', 'assistant'].includes(message.role) || !message.content?.trim()) continue
+    messages.push({ role: message.role, content: message.content.trim() })
   }
 
   if (context.length && messages.length) {
-    const lastMessage = messages[messages.length - 1];
-    if (lastMessage.role === 'user') lastMessage.content += `\n\n${context.join('\n\n')}`;
+    const lastMessage = messages[messages.length - 1]
+    if (lastMessage.role === 'user') lastMessage.content += `\n\n${context.join('\n\n')}`
   }
 
-  return messages;
+  return messages
 }
 
 async function complete({ history, systemPrompt, memory, ragContext, fileContext, maxTokens, temperature }) {
-  const messages = buildMessages({ history, systemPrompt, memory, ragContext, fileContext });
+  const messages = buildMessages({ history, systemPrompt, memory, ragContext, fileContext })
   if (!messages.some(message => message.role === 'user')) {
-    const error = new Error('INVALID_CONVERSATION');
-    error.code = 'INVALID_CONVERSATION';
-    throw error;
+    const error = new Error('INVALID_CONVERSATION')
+    error.code = 'INVALID_CONVERSATION'
+    throw error
   }
 
-  const completion = await getClient().chat.completions.create({
-    model: process.env.GROQ_MODEL || DEFAULT_MODEL,
+  const result = await provider.chatComplete({
     messages,
-    max_tokens: Number(maxTokens) || 2048,
-    temperature: Number.isFinite(Number(temperature)) ? Number(temperature) : 0.7
-  });
-
-  const text = completion.choices?.[0]?.message?.content?.trim();
-  if (!text) {
-    const error = new Error('EMPTY_AI_RESPONSE');
-    error.code = 'EMPTY_AI_RESPONSE';
-    throw error;
-  }
-  return { text, model: process.env.GROQ_MODEL || DEFAULT_MODEL };
+    model: process.env.GROQ_CHAT_MODEL || process.env.GROQ_MODEL || config.models.chat,
+    maxTokens: Number(maxTokens) || 2048,
+    temperature: Number.isFinite(Number(temperature)) ? Number(temperature) : 0.7,
+  })
+  return { text: result.text, model: result.model }
 }
 
-module.exports = { complete, buildMessages, DEFAULT_MODEL };
+module.exports = { complete, buildMessages, DEFAULT_MODEL }

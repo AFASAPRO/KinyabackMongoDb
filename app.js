@@ -16,6 +16,12 @@ const crypto     = require('crypto');
 const nodemailer = require('nodemailer');
 const admin      = require('firebase-admin');
 const { complete: completeWithGroq, DEFAULT_MODEL } = require('./ai-service');
+const aiConfig        = require('./services/ai/config');
+const provider        = require('./services/ai/groqProvider');
+const chatService     = require('./services/ai/chatService');
+const documentService = require('./services/ai/documentService');
+const speechService   = require('./services/ai/speechService');
+const rateLimiter     = require('./services/rateLimiter');
 
 const {
   User, Chat, Message, Admin, Notification, PageView,
@@ -50,7 +56,8 @@ async function connectDB() {
 const allowedOrigins = [
   "https://kinyabotai.vercel.app",
   "http://localhost:5173",
-  "http://localhost:3000"
+  "http://localhost:3000",
+  "http://localhost:4173"
 ];
 
 app.use(cors({
@@ -89,7 +96,38 @@ const upload = multer({
     cb(null, allowed.test(file.originalname));
   }
 });
-app.use('/uploads', express.static('uploads'));
+// NOTE: public static serving of ./uploads was REMOVED for privacy (§19).
+// Attachments are now served exclusively through the authenticated,
+// ownership-checked GET /api/files/:name endpoint (see CHAT ROUTES).
+const CHAT_FILE_FILTER = /\.(jpg|jpeg|png|gif|webp|pdf|txt|md|csv|json|docx|py|js|ts|html|css|xml|yaml|yml|mp3|wav|m4a|ogg|webm|flac|aac|mp4)$/i;
+const uploadChat = multer({
+  storage: multer.diskStorage({
+    destination(_, __, cb) {
+      const d = './uploads';
+      if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+      cb(null, d);
+    },
+    filename(_, file, cb) {
+      cb(null, `c_${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`);
+    }
+  }),
+  limits: { fileSize: Math.max(aiConfig.limits.imageSizeBytes, aiConfig.limits.documentSizeBytes) },
+  fileFilter(_, file, cb) { cb(null, CHAT_FILE_FILTER.test(file.originalname)); }
+});
+const uploadAudio = multer({
+  storage: multer.diskStorage({
+    destination(_, __, cb) {
+      const d = './uploads';
+      if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+      cb(null, d);
+    },
+    filename(_, file, cb) {
+      cb(null, `a_${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`);
+    }
+  }),
+  limits: { fileSize: aiConfig.limits.audioSizeBytes },
+  fileFilter(_, file, cb) { cb(null, /\.(mp3|wav|m4a|ogg|webm|flac|aac|mp4)$/i.test(file.originalname)); }
+});
 
 /* ── SETTINGS ────────────────────────────────────────────────── */
 const SETTINGS_FILE = './admin-settings.json';
@@ -155,8 +193,16 @@ app.use((req, res, next) => {
 /* ── HELPERS ─────────────────────────────────────────────────── */
 function friendlyError(err) {
   const msg = String(err?.message || err || '');
+  // Honest, user-safe errors thrown by the AI services pass through as-is
+  if (err?.userSafe) return err.message;
   if (err?.code === 'GROQ_NOT_CONFIGURED')
     return 'KinyaBot AI is not configured yet. Please contact the administrator.';
+  if (err?.code === 'AI_AUTH')
+    return 'KinyaBot AI rejected its configured credentials. Please contact the administrator.';
+  if (err?.code === 'AI_MODEL_UNAVAILABLE')
+    return 'The configured AI model is currently unavailable. Please try again later or contact the administrator.';
+  if (err?.code === 'AI_RATE_LIMIT')
+    return 'KinyaBot is very busy right now. Please wait a moment and try again.';
   if (err?.status === 401 || msg.includes('401'))
     return 'KinyaBot AI is temporarily unavailable. Please contact the administrator.';
   if (err?.status === 429 || msg.includes('429') || msg.toLowerCase().includes('rate limit'))
@@ -266,6 +312,20 @@ function fmt(doc) {
   return obj;
 }
 function fmtArr(docs) { return docs.map(fmt); }
+/* Message formatter — keeps API payloads light by never shipping the
+   stored document text used for context building (it can be large). */
+function fmtMessage(doc) {
+  const obj = fmt(doc);
+  if (Array.isArray(obj.attachments)) {
+    obj.attachments = obj.attachments.map(a => {
+      const { extracted_text, ...rest } = a || {};
+      void extracted_text;
+      return rest;
+    });
+  }
+  return obj;
+}
+function fmtMessageArr(docs) { return docs.map(fmtMessage); }
 
 /* ══════════════════════════════════════════════════════════════
    USER AUTH
@@ -479,7 +539,7 @@ app.get('/api/chats/:id', authGuard, async (req, res) => {
     const chat = await Chat.findOne({ _id: req.params.id, user_id: req.user.id }).lean();
     if (!chat) return res.status(404).json({ error: 'Chat not found' });
     const messages = await Message.find({ chat_id: req.params.id }).sort({ created_at: 1 }).lean();
-    res.json({ ...chat, id: chat._id.toString(), _id: undefined, messages: fmtArr(messages) });
+    res.json({ ...chat, id: chat._id.toString(), _id: undefined, messages: fmtMessageArr(messages) });
   } catch { res.status(500).json({ error: 'Could not load chat' }); }
 });
 
@@ -515,37 +575,227 @@ app.delete('/api/chats', authGuard, async (req, res) => {
   } catch { res.status(500).json({ error: 'Could not delete chats' }); }
 });
 
-/* ── SEND MESSAGE (SSE Streaming) ────────────────────────────── */
-app.post('/api/chats/:id/messages/stream', authGuard, upload.single('file'), async (req, res) => {
+/* ── AUTHENTICATED FILE SERVING (ownership-checked, §19) ─────── */
+app.get('/api/files/:name', async (req, res) => {
+  const name = path.basename(req.params.name); // prevents path traversal
+  const filePath = path.join('./uploads', name);
+  if (!name || !fs.existsSync(filePath) || !fs.statSync(filePath).isFile())
+    return res.status(404).json({ error: 'File not found' });
+
+  const h = req.headers.authorization;
+  let adminOk = false, user = null;
+  if (h?.startsWith('Bearer ')) {
+    const token = h.slice(7);
+    try { const d = jwt.verify(token, ADMIN_SECRET); if (d.isAdmin) adminOk = true; } catch {}
+    if (!adminOk) { try { user = jwt.verify(token, JWT_SECRET); } catch {} }
+  }
+  if (!adminOk && !user) return res.status(401).json({ error: 'Unauthorized' });
+
+  if (!adminOk) {
+    // Owners only: the file must belong to one of the requester's messages
+    const msg = await Message.findOne({
+      $or: [{ file_url: `/uploads/${name}` }, { 'attachments.url': `/uploads/${name}` }]
+    }).populate('chat_id', 'user_id').lean();
+    const ownerId = msg?.chat_id?.user_id?.toString ? msg.chat_id.user_id.toString() : null;
+    if (!msg || ownerId !== user.id) return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  res.setHeader('Cache-Control', 'private, max-age=86400');
+  if (req.query.download === '1') res.setHeader('Content-Disposition', `attachment; filename="${name.split('-').slice(1).join('-') || name}"`);
+  res.sendFile(path.resolve(filePath));
+});
+
+/* ── Shared assistant turn (real Groq streaming, SSE) ────────── */
+async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = 'chat' }) {
+  const abortController = new AbortController();
+  let clientClosed = false;
+  req.on('close', () => { clientClosed = true; try { abortController.abort(new Error('client closed')); } catch {} });
+
+  const chatId = String(chat._id);
+  const memory = await getUserMemory(req.user.id);
+
+  // Context: bounded window + budget trim + rolling summary (§5)
+  const fullHistory = await chatService.loadHistory(chatId);
+  const { kept, droppedCount } = chatService.trimToBudget(fullHistory);
+  const summary = await chatService.ensureSummary(chat, kept, droppedCount);
+  const ragContext = cfg.knowledge_base_enabled ? await searchKnowledgeBase(kept[kept.length - 1]?.content || '') : '';
+  const documentContext = chatService.findRecentDocumentContext(kept);
+
+  // Multimodal: image attached to the most recent user turn (§8)
+  const lastUser = [...kept].reverse().find(m => m.role === 'user');
+  const imgAtt = lastUser?.attachments?.find(a => a.kind === 'image');
+  let imageDataUrl = null;
+  if (imgAtt) {
+    try {
+      const imgPath = imgAtt.url.replace('/uploads', './uploads');
+      const b64 = fs.readFileSync(imgPath).toString('base64');
+      imageDataUrl = `data:${imgAtt.mime || 'image/jpeg'};base64,${b64}`;
+    } catch (e) {
+      console.error('[Stream] image load failed:', e.message);
+      send('error', { message: 'KinyaBot could not open the attached image. Please re-attach it and try again.' });
+      return res.end();
+    }
+  }
+
+  const messages = chatService.buildMessages({
+    systemPrompt: cfg.system_prompt, memory, ragContext,
+    history: kept, summary, documentContext,
+    userText: lastUser?.content || '',
+    imageDataUrl,
+  });
+  const model = chatService.pickModel({ imageDataUrl });
+
+  send('start', { streaming: true });
+
+  let aiText = '';
+  let usageTokens = null;
+  const stream = await provider.chatCompleteStream({
+    messages, model,
+    maxTokens: cfg.max_tokens, temperature: cfg.temperature,
+    signal: abortController.signal,
+  });
+
+  try {
+    for await (const chunk of stream) {
+      const delta = chunk.choices?.[0]?.delta?.content || '';
+      if (chunk.usage?.total_tokens) usageTokens = chunk.usage.total_tokens;
+      if (delta) { aiText += delta; send('chunk', { text: delta }); }
+      if (clientClosed) break;
+    }
+  } catch (err) {
+    if (!clientClosed) throw err;
+  }
+
+  // Client cancelled mid-generation → keep the partial answer honestly (§17)
+  if (clientClosed) {
+    if (aiText.trim()) {
+      await Message.create({
+        chat_id: chatId, role: 'assistant', content: aiText,
+        model, provider: aiConfig.provider, tokens: usageTokens,
+        processing_ms: Date.now() - startedAt, status: 'cancelled',
+      });
+    }
+    return;
+  }
+
+  if (!aiText.trim()) { const e = new Error('EMPTY_AI_RESPONSE'); e.code = 'EMPTY_AI_RESPONSE'; throw e; }
+
+  // Source references ONLY when the backend actually knows them (§7)
+  const sources = (!imageDataUrl && documentContext)
+    ? [`${documentContext.name}${documentContext.pages ? ` (${documentContext.pages} pages)` : ''}`]
+    : [];
+
+  const aiMsg = await Message.create({
+    chat_id: chatId, role: 'assistant', content: aiText,
+    model, provider: aiConfig.provider, tokens: usageTokens,
+    processing_ms: Date.now() - startedAt, status: 'completed', sources,
+  });
+  chat.updated_at = new Date();
+  await chat.save();
+
+  const tokens = usageTokens || estimateTokens(messages.map(m => (m.content || (Array.isArray(m.content) ? m.content.map(c => c.text || '').join(' ') : '')).slice(0, 400)).join('\n') + aiText);
+  await trackUsage(req.user.id, chatId, tokens, trackType, Date.now() - startedAt, true);
+  await extractMemoryFromConversation(req.user.id, lastUser?.content || '', aiText);
+
+  const io = req.app.get('io');
+  if (io) {
+    io.to(`chat_${chatId}`).emit('new_message', { userMessage: null, aiMessage: fmtMessage(aiMsg), chatId });
+    io.to(`user_${req.user.id}`).emit('chat_updated', { chatId });
+  }
+
+  send('done', { aiMessage: fmtMessage(aiMsg), userMessage: null });
+  res.end();
+}
+
+/* Validate + prepare a chat attachment (server-side truth, §19) */
+function prepareAttachment(req) {
+  if (!req.file) return { meta: null, imageDataUrl: null, documentExtract: null, messageType: 'text' };
+  const kind = documentService.classify(req.file.originalname, req.file.mimetype);
+  if (kind === 'unknown')
+    throw documentService.coded('UNSUPPORTED_FILE', 'That file type is not supported. Attach an image, PDF, DOCX, TXT or code file.');
+
+  const valid = documentService.validateUpload(req.file.path, kind === 'image' ? 'image' : kind, req.file.originalname);
+  const url = `/uploads/${req.file.filename}`;
+  const baseMeta = { kind, url, name: req.file.originalname, mime: req.file.mimetype, size: valid.size };
+
+  if (kind === 'image') {
+    const b64 = fs.readFileSync(req.file.path).toString('base64');
+    return { meta: baseMeta, imageDataUrl: `data:${req.file.mimetype};base64,${b64}`, documentExtract: null, messageType: 'image' };
+  }
+  if (kind === 'document') {
+    return { meta: baseMeta, imageDataUrl: null, documentExtract: null, messageType: 'document', needsExtract: true };
+  }
+  throw documentService.coded('UNSUPPORTED_FILE', 'That file type cannot be used in chat.');
+}
+
+/* ── SEND MESSAGE (SSE Streaming, multimodal) ────────────────── */
+app.post('/api/chats/:id/messages/stream', authGuard, uploadChat.single('file'), async (req, res) => {
   const { content } = req.body;
   const chatId = req.params.id;
   if (!content && !req.file) return res.status(400).json({ error: 'Message or file required' });
 
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-  res.flushHeaders();
+  // Abuse protection (§20): burst rate + existing daily quota
+  const rl = rateLimiter.allow(req.user.id, 'chat', aiConfig.rateLimits.chat);
+  if (!rl.ok) return rateLimiter.tooMany(res, rl.retryAfterSec);
+  if (req.file) {
+    const ul = rateLimiter.allow(req.user.id, 'upload', aiConfig.rateLimits.upload);
+    if (!ul.ok) return rateLimiter.tooMany(res, ul.retryAfterSec);
+  }
+  const quota = await rateLimiter.dailyQuotaOk(req.user.id, cfg.free_daily_limit);
+  if (!quota.ok)
+    return res.status(429).json({ error: `You have reached your daily limit of ${quota.limit} messages. Your quota resets tomorrow.` });
 
-  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   const startTime = Date.now();
 
   try {
     const chat = await Chat.findOne({ _id: chatId, user_id: req.user.id });
-    if (!chat) { send('error', { message: 'Chat not found' }); return res.end(); }
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
 
     if (content) {
       const mod = await moderateContent(content);
       if (mod.flagged) {
         await FlaggedContent.create({ chat_id: chatId, user_id: req.user.id, reason: mod.reason, auto_flagged: true });
-        send('error', { message: 'Your message was flagged. Please keep conversations respectful.' });
-        return res.end();
+        return res.status(400).json({ error: 'Your message was flagged. Please keep conversations respectful.' });
       }
     }
 
-    const fileUrl = req.file ? `/uploads/${req.file.filename}` : null;
-    const userMsg = await Message.create({ chat_id: chatId, role: 'user', content: content || '', file_url: fileUrl });
-    send('user_message', fmt(userMsg));
+    // Validate/prepare the attachment BEFORE any SSE output so client
+    // errors arrive as normal JSON the frontend can display honestly.
+    let prepared;
+    try { prepared = prepareAttachment(req); }
+    catch (err) { return res.status(400).json({ error: friendlyError(err) }); }
+
+    let documentExtract = null;
+    if (prepared.needsExtract) {
+      try {
+        documentExtract = await documentService.extractText(req.file.path, req.file.originalname, req.file.mimetype);
+      } catch (err) {
+        // Honest failure (§6): no fabricated reading of the document
+        return res.status(422).json({ error: friendlyError(err), attachmentSaved: false });
+      }
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
+    const meta = prepared.meta ? { ...prepared.meta } : null;
+    if (meta && documentExtract) {
+      meta.extracted_text = documentExtract.text;
+      meta.pages = documentExtract.pages;
+    }
+
+    const userMsg = await Message.create({
+      chat_id: chatId, role: 'user', content: content || '',
+      file_url: meta ? meta.url : null,
+      message_type: prepared.messageType,
+      attachments: meta ? [meta] : [],
+    });
+    send('user_message', fmtMessage(userMsg));
 
     // Auto-title
     const msgCount = await Message.countDocuments({ chat_id: chatId });
@@ -554,67 +804,111 @@ app.post('/api/chats/:id/messages/stream', authGuard, upload.single('file'), asy
       await chat.save();
     }
 
-    // Build context for the centralized Groq service.
-    const history = await Message.find({ chat_id: chatId }).sort({ created_at: 1 }).limit(cfg.max_context_messages).lean();
-    const memory = await getUserMemory(req.user.id);
-    const ragContext = cfg.knowledge_base_enabled && content ? await searchKnowledgeBase(content) : '';
-    let fileContext = '';
-    if (req.file) {
-      const text = extractTextFromFile(req.file.path);
-      if (text) fileContext = `[Attached file: ${req.file.originalname}]\n${text}`;
-    }
-
-    let aiText = '';
-    try {
-      aiText = (await completeWithGroq({
-        history, systemPrompt: cfg.system_prompt, memory, ragContext, fileContext,
-        maxTokens: cfg.max_tokens, temperature: cfg.temperature
-      })).text;
-    } catch (err) {
-      send('error', { message: friendlyError(err) });
-      await trackUsage(req.user.id, chatId, 0, 'chat', Date.now() - startTime, false);
-      return res.end();
-    }
-
-    send('start', { streaming: true });
-    const words = aiText.split(' ');
-    let streamed = '';
-    for (let i = 0; i < words.length; i++) {
-      const chunk = (i === 0 ? '' : ' ') + words[i];
-      streamed += chunk;
-      send('chunk', { text: chunk });
-      await new Promise(r => setTimeout(r, Math.min(30, 5 + Math.random() * 25)));
-    }
-
-    const aiMsg = await Message.create({ chat_id: chatId, role: 'assistant', content: aiText });
-    chat.updated_at = new Date();
-    await chat.save();
-
-    const tokens = estimateTokens(history.map(message => message.content).join('\n') + aiText);
-    await trackUsage(req.user.id, chatId, tokens, 'chat', Date.now() - startTime, true);
-    await extractMemoryFromConversation(req.user.id, content || '', aiText);
-
-    const io = req.app.get('io');
-    if (io) {
-      io.to(`chat_${chatId}`).emit('new_message', { userMessage: fmt(userMsg), aiMessage: fmt(aiMsg), chatId });
-      io.to(`user_${req.user.id}`).emit('chat_updated', { chatId });
-    }
-
-    send('done', { aiMessage: fmt(aiMsg), userMessage: fmt(userMsg) });
-    res.end();
+    await runAssistantTurn(req, res, { chat, send, startedAt: startTime, trackType: prepared.messageType === 'image' ? 'image' : (prepared.messageType === 'document' ? 'document' : 'chat') });
   } catch (err) {
     console.error('[Stream]', err);
-    send('error', { message: friendlyError(err) });
-    res.end();
+    // Headers may not be sent yet if a pre-stream step threw
+    if (!res.headersSent) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.flushHeaders();
+    }
+    try {
+      res.write(`event: error\ndata: ${JSON.stringify({ message: friendlyError(err) })}\n\n`);
+      await trackUsage(req.user.id, chatId, 0, 'chat', Date.now() - startTime, false);
+      res.end();
+    } catch { res.end(); }
+  }
+});
+
+/* ── REGENERATE last response (SSE, §16) ─────────────────────── */
+app.post('/api/chats/:id/regenerate/stream', authGuard, async (req, res) => {
+  const chatId = req.params.id;
+  const rl = rateLimiter.allow(req.user.id, 'chat', aiConfig.rateLimits.chat);
+  if (!rl.ok) return rateLimiter.tooMany(res, rl.retryAfterSec);
+  const quota = await rateLimiter.dailyQuotaOk(req.user.id, cfg.free_daily_limit);
+  if (!quota.ok)
+    return res.status(429).json({ error: `You have reached your daily limit of ${quota.limit} messages. Your quota resets tomorrow.` });
+
+  try {
+    const chat = await Chat.findOne({ _id: chatId, user_id: req.user.id });
+    if (!chat) return res.status(404).json({ error: 'Chat not found' });
+
+    const lastUser = await Message.findOne({ chat_id: chatId, role: 'user' }).sort({ created_at: -1, _id: -1 }).lean();
+    if (!lastUser) return res.status(400).json({ error: 'Nothing to regenerate yet.' });
+
+    // Drop assistant messages generated after the last user message
+    await Message.deleteMany({ chat_id: chatId, role: 'assistant', _id: { $gt: lastUser._id } });
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+    const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    send('user_message', fmtMessage(lastUser));
+
+    await runAssistantTurn(req, res, { chat, send, startedAt: Date.now(), trackType: 'regenerate' });
+  } catch (err) {
+    console.error('[Regenerate]', err);
+    if (!res.headersSent) { res.setHeader('Content-Type', 'text/event-stream'); res.flushHeaders(); }
+    try { res.write(`event: error\ndata: ${JSON.stringify({ message: friendlyError(err) })}\n\n`); res.end(); } catch { res.end(); }
+  }
+});
+
+/* ── SPEECH-TO-TEXT (voice input, §11/§12) ───────────────────── */
+app.post('/api/stt', authGuard, uploadAudio.single('audio'), async (req, res) => {
+  const rl = rateLimiter.allow(req.user.id, 'stt', aiConfig.rateLimits.stt);
+  if (!rl.ok) return rateLimiter.tooMany(res, rl.retryAfterSec);
+  if (!req.file) return res.status(400).json({ error: 'No audio received.' });
+  const filePath = req.file.path;
+  try {
+    try { documentService.validateUpload(filePath, 'audio', req.file.originalname); }
+    catch (err) { return res.status(400).json({ error: friendlyError(err) }); }
+    const result = await speechService.transcribe(filePath);
+    await trackUsage(req.user.id, null, estimateTokens(result.text || ''), 'stt', 0, true);
+    res.json({ text: result.text, language: result.language, duration: result.duration });
+  } catch (err) {
+    console.error('[STT]', err.code || '', err.message);
+    await trackUsage(req.user.id, null, 0, 'stt', 0, false);
+    res.status(502).json({ error: friendlyError(err) });
+  } finally {
+    try { fs.unlinkSync(filePath); } catch {}
+  }
+});
+
+/* ── TEXT-TO-SPEECH (voice output, §13) ──────────────────────── */
+app.post('/api/tts', authGuard, async (req, res) => {
+  const rl = rateLimiter.allow(req.user.id, 'tts', aiConfig.rateLimits.tts);
+  if (!rl.ok) return rateLimiter.tooMany(res, rl.retryAfterSec);
+  const { text } = req.body;
+  if (!text || !String(text).trim()) return res.status(400).json({ error: 'Text required.' });
+  try {
+    const { buffer, model } = await speechService.synthesize(String(text));
+    await trackUsage(req.user.id, null, estimateTokens(String(text)), 'tts', 0, true);
+    res.setHeader('Content-Type', 'audio/wav');
+    res.setHeader('X-TTS-Model', model);
+    res.send(buffer);
+  } catch (err) {
+    console.error('[TTS]', err.code || '', err.message);
+    await trackUsage(req.user.id, null, 0, 'tts', 0, false);
+    res.status(err?.code === 'TTS_TOO_LONG' || err?.code === 'TTS_EMPTY_INPUT' ? 400 : 502).json({ error: friendlyError(err) });
   }
 });
 
 /* ── SEND MESSAGE (non-streaming fallback) ───────────────────── */
-app.post('/api/chats/:id/messages', authGuard, upload.single('file'), async (req, res) => {
+/* ── SEND MESSAGE (non-streaming fallback) ───────────────────── */
+app.post('/api/chats/:id/messages', authGuard, uploadChat.single('file'), async (req, res) => {
   const { content } = req.body;
   const chatId = req.params.id;
   if (!content && !req.file) return res.status(400).json({ error: 'Message or file required' });
   const startTime = Date.now();
+
+  const rl = rateLimiter.allow(req.user.id, 'chat', aiConfig.rateLimits.chat);
+  if (!rl.ok) return rateLimiter.tooMany(res, rl.retryAfterSec);
+  const quota = await rateLimiter.dailyQuotaOk(req.user.id, cfg.free_daily_limit);
+  if (!quota.ok)
+    return res.status(429).json({ error: `You have reached your daily limit of ${quota.limit} messages. Your quota resets tomorrow.` });
+
   try {
     const chat = await Chat.findOne({ _id: chatId, user_id: req.user.id });
     if (!chat) return res.status(404).json({ error: 'Chat not found' });
@@ -627,46 +921,83 @@ app.post('/api/chats/:id/messages', authGuard, upload.single('file'), async (req
       }
     }
 
-    const fileUrl = req.file ? `/uploads/${req.file.filename}` : null;
-    const userMsg = await Message.create({ chat_id: chatId, role: 'user', content: content || '', file_url: fileUrl });
+    let prepared;
+    try { prepared = prepareAttachment(req); }
+    catch (err) { return res.status(400).json({ error: friendlyError(err) }); }
+
+    let documentExtract = null;
+    if (prepared.needsExtract) {
+      try { documentExtract = await documentService.extractText(req.file.path, req.file.originalname, req.file.mimetype); }
+      catch (err) { return res.status(422).json({ error: friendlyError(err) }); }
+    }
+
+    const meta = prepared.meta ? { ...prepared.meta } : null;
+    if (meta && documentExtract) { meta.extracted_text = documentExtract.text; meta.pages = documentExtract.pages; }
+
+    const userMsg = await Message.create({
+      chat_id: chatId, role: 'user', content: content || '',
+      file_url: meta ? meta.url : null,
+      message_type: prepared.messageType,
+      attachments: meta ? [meta] : [],
+    });
 
     const msgCount = await Message.countDocuments({ chat_id: chatId });
     if (msgCount <= 1 && content) { chat.title = content.slice(0, 60); await chat.save(); }
 
-    const history = await Message.find({ chat_id: chatId }).sort({ created_at: 1 }).limit(cfg.max_context_messages).lean();
+    // Context via AI Core (bounded window + budget + rolling summary)
+    const fullHistory = await chatService.loadHistory(chatId);
+    const { kept, droppedCount } = chatService.trimToBudget(fullHistory);
+    const summary = await chatService.ensureSummary(chat, kept, droppedCount);
     const memory = await getUserMemory(req.user.id);
     const ragCtx = cfg.knowledge_base_enabled && content ? await searchKnowledgeBase(content) : '';
-    let fileContext = '';
-    if (req.file) {
-      const text = extractTextFromFile(req.file.path);
-      if (text) fileContext = `[Attached: ${req.file.originalname}]\n${text}`;
-    }
+    const documentContext = chatService.findRecentDocumentContext(kept);
 
-    let aiText;
-    try {
-      aiText = (await completeWithGroq({
-        history, systemPrompt: cfg.system_prompt, memory, ragContext: ragCtx, fileContext,
-        maxTokens: cfg.max_tokens, temperature: cfg.temperature
-      })).text;
-    } catch (err) {
-      await trackUsage(req.user.id, chatId, 0, 'chat', Date.now() - startTime, false);
-      return res.status(503).json({ error: friendlyError(err) });
+    // Vision turn (image understanding)
+    let result;
+    if (prepared.imageDataUrl) {
+      const historyText = kept.filter(m => !(String(m._id) === String(userMsg._id)) && m.content?.trim())
+        .slice(-6).map(m => ({ role: m.role, content: m.content.trim() }));
+      result = await provider.visionComplete({
+        prompt: content || 'What is in this image?',
+        imageDataUrl: prepared.imageDataUrl,
+        history: historyText, systemPrompt: cfg.system_prompt,
+        maxTokens: cfg.max_tokens, temperature: cfg.temperature,
+      });
+    } else {
+      const messages = chatService.buildMessages({
+        systemPrompt: cfg.system_prompt, memory, ragContext: ragCtx,
+        history: kept, summary, documentContext,
+        userText: content || '',
+      });
+      result = await provider.chatComplete({
+        messages, model: chatService.pickModel({}),
+        maxTokens: cfg.max_tokens, temperature: cfg.temperature,
+      });
     }
+    const aiText = result.text;
 
-    const aiMsg = await Message.create({ chat_id: chatId, role: 'assistant', content: aiText });
+    const sources = (!prepared.imageDataUrl && documentContext)
+      ? [`${documentContext.name}${documentContext.pages ? ` (${documentContext.pages} pages)` : ''}`]
+      : [];
+
+    const aiMsg = await Message.create({
+      chat_id: chatId, role: 'assistant', content: aiText,
+      model: result.model, provider: aiConfig.provider, tokens: result.tokens,
+      processing_ms: Date.now() - startTime, status: 'completed', sources,
+    });
     chat.updated_at = new Date();
     await chat.save();
 
-    const tokens = estimateTokens(history.map(message => message.content).join('\n') + aiText);
-    await trackUsage(req.user.id, chatId, tokens, 'chat', Date.now() - startTime, true);
+    const tokens = result.tokens || estimateTokens(kept.map(m => m.content).join('\n') + aiText);
+    await trackUsage(req.user.id, chatId, tokens, prepared.messageType === 'image' ? 'image' : 'chat', Date.now() - startTime, true);
     await extractMemoryFromConversation(req.user.id, content || '', aiText);
 
     const io = req.app.get('io');
     if (io) {
-      io.to(`chat_${chatId}`).emit('new_message', { userMessage: fmt(userMsg), aiMessage: fmt(aiMsg), chatId });
+      io.to(`chat_${chatId}`).emit('new_message', { userMessage: fmtMessage(userMsg), aiMessage: fmtMessage(aiMsg), chatId });
       io.to(`user_${req.user.id}`).emit('chat_updated', { chatId });
     }
-    res.json({ userMessage: fmt(userMsg), aiMessage: fmt(aiMsg) });
+    res.json({ userMessage: fmtMessage(userMsg), aiMessage: fmtMessage(aiMsg) });
   } catch (err) {
     console.error('[Message]', err);
     res.status(500).json({ error: friendlyError(err) });
@@ -1322,6 +1653,16 @@ io.on('connection', socket => {
     });
   }
   if (socket.admin) { socket.join('admin_room'); }
+});
+
+/* ── UPLOAD ERROR HANDLING (friendly client errors) ─────────── */
+app.use((err, req, res, next) => {
+  if (err?.code === 'LIMIT_FILE_SIZE')
+    return res.status(400).json({ error: 'That file is too large. Images: 4 MB, documents: 15 MB, audio: 15 MB.' });
+  if (err?.name === 'MulterError')
+    return res.status(400).json({ error: 'The file could not be uploaded. Please try again.' });
+  console.error('[Server]', err);
+  res.status(500).json({ error: 'Something went wrong. Please try again.' });
 });
 
 /* ── START ───────────────────────────────────────────────────── */

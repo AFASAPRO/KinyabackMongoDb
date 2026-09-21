@@ -29,16 +29,40 @@ const chatSchema = new Schema({
   user_id:   { type: Schema.Types.ObjectId, ref: 'User', required: true },
   title:     { type: String, default: 'New Chat', maxlength: 255 },
   is_pinned: { type: Boolean, default: false },
+  // Rolling context summary for very long conversations (AI Core §5)
+  summary:       { type: String, default: null },
+  summary_depth: { type: Number, default: 0 },   // message count covered by the summary
 }, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
 
 chatSchema.index({ user_id: 1, updated_at: -1 });
 
 /* ── MESSAGE ──────────────────────────────────────────────────── */
+const attachmentSchema = new Schema({
+  kind:           { type: String, enum: ['image', 'document', 'audio'], required: true },
+  url:            { type: String, required: true },   // served via authenticated /api/files/:name
+  name:           { type: String, default: '' },
+  mime:           { type: String, default: null },
+  size:           { type: Number, default: 0 },
+  pages:          { type: Number, default: null },    // PDFs where known — never fabricated
+  extracted_text: { type: String, default: null },    // bounded document text for follow-ups
+}, { _id: false });
+
 const messageSchema = new Schema({
-  chat_id:  { type: Schema.Types.ObjectId, ref: 'Chat', required: true },
-  role:     { type: String, enum: ['user', 'assistant'], required: true },
-  content:  { type: String, required: true },
-  file_url: { type: String, default: null },
+  chat_id:       { type: Schema.Types.ObjectId, ref: 'Chat', required: true },
+  role:          { type: String, enum: ['user', 'assistant'], required: true },
+  content:       { type: String, required: true },
+  file_url:      { type: String, default: null },            // legacy single-attachment field
+  message_type:  { type: String, enum: ['text', 'image', 'document', 'audio'], default: 'text' },
+  attachments:   { type: [attachmentSchema], default: [] },
+  // AI provenance (assistant messages)
+  model:         { type: String, default: null },
+  provider:      { type: String, default: null },
+  tokens:        { type: Number, default: null },
+  processing_ms: { type: Number, default: null },
+  // generation lifecycle: completed | cancelled (partial) | failed
+  status:        { type: String, enum: ['completed', 'cancelled', 'failed'], default: 'completed' },
+  // surfaced sources (only when the backend actually knows them)
+  sources:       { type: [String], default: [] },
 }, { timestamps: { createdAt: 'created_at', updatedAt: false } });
 
 messageSchema.index({ chat_id: 1, created_at: 1 });
@@ -112,7 +136,7 @@ const usageTrackingSchema = new Schema({
   user_id:      { type: Schema.Types.ObjectId, ref: 'User', required: true },
   chat_id:      { type: Schema.Types.ObjectId, ref: 'Chat', default: null },
   tokens_used:  { type: Number, default: 0 },
-  request_type: { type: String, enum: ['chat', 'image', 'file'], default: 'chat' },
+  request_type: { type: String, enum: ['chat', 'image', 'file', 'regenerate', 'stt', 'tts', 'document'], default: 'chat' },
   response_ms:  { type: Number, default: 0 },
   success:      { type: Boolean, default: true },
 }, { timestamps: { createdAt: 'created_at', updatedAt: false } });
