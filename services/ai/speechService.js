@@ -38,7 +38,7 @@ async function synthesize(text) {
   } catch (err) {
     if (err.userSafe) throw err
     if (err.code === 'AI_AUTH' || err.code === 'AI_MODEL_UNAVAILABLE')
-      throw userSafe('TTS_UNAVAILABLE', 'Voice output is not enabled on the AI provider yet. Ask the administrator to enable the TTS model.')
+      throw userSafe('TTS_UNAVAILABLE', `Voice output is not available on the configured TTS model (${config.models.tts}). Ask the administrator to enable this model on the Groq account.`)
     if (err.code === 'AI_RATE_LIMIT') throw userSafe('TTS_RATE_LIMIT', 'Voice output is busy right now. Please wait a moment and try again.')
     throw userSafe('TTS_FAILED', 'KinyaBot could not generate audio for this response. Please try again.')
   }

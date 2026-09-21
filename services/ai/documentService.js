@@ -81,6 +81,31 @@ function coded(code, message) { const e = new Error(message); e.code = code; e.u
 
 /* ── Text extraction ─────────────────────────────────────────── */
 
+/**
+ * PDF extraction runs in a dedicated child process: mongoose 8 and
+ * the pdf.js bundled with pdf-parse 1.1.1 corrupt each other when
+ * loaded into the same VM (lexer breaks → "Command token too long").
+ * The worker never loads app code, so parsing always sees a clean
+ * Node environment regardless of what the server has loaded.
+ */
+function extractPdfInWorker(filePath) {
+  return new Promise((resolve, reject) => {
+    const { fork } = require('child_process')
+    let settled = false
+    const done = (fn, arg) => { if (!settled) { settled = true; clearTimeout(timer); try { child.kill() } catch {} ; fn(arg) } }
+    const child = fork(path.join(__dirname, 'pdfWorker.js'),
+      [filePath, String(config.limits.documentMaxChars)],
+      { stdio: 'ignore', execArgv: [] })
+    const timer = setTimeout(() => done(() => reject(coded('DOC_PROCESS_TIMEOUT', 'That PDF took too long to process. Try a smaller document.'))), 30000)
+    child.on('message', (msg) => {
+      if (msg && msg.ok === false) done(() => reject(coded(msg.code || 'DOC_PROCESS_FAILED', msg.message || 'KinyaBot could not read that PDF.')))
+      else done(() => resolve(msg))
+    })
+    child.on('error', (err) => done(() => reject(coded('DOC_PROCESS_FAILED', err?.message || 'PDF processing failed.'))))
+    child.on('exit', (codeNum) => { if (!settled && codeNum !== 0) done(() => reject(coded('DOC_PROCESS_FAILED', 'KinyaBot could not read that PDF.'))) })
+  })
+}
+
 /** Extract raw text from a file path. Returns
  *  { text, pages, info } — or throws a user-safe error. */
 async function extractText(filePath, originalName, mimetype) {
@@ -90,18 +115,17 @@ async function extractText(filePath, originalName, mimetype) {
   if (ext === '.pdf') {
     let data
     try {
-      // pdf-parse debug quirk: require the library entry directly
-      const pdfParse = require('pdf-parse')
-      data = await pdfParse(fs.readFileSync(filePath))
-    } catch {
+      data = await extractPdfInWorker(filePath)
+    } catch (err) {
+      if (err?.userSafe) throw err
       throw coded('DOC_PROCESS_FAILED', 'KinyaBot could not read that PDF. It may be corrupted or password-protected.')
     }
     const text = (data.text || '').replace(/\u0000/g, '').trim()
-    meta.pages = data.numpages || null
+    meta.pages = data.pages || null
     if (!text || text.length < 8) {
       throw coded('DOC_NO_TEXT', 'That PDF has no extractable text — it may be a scanned document. Try a text-based PDF.')
     }
-    return { text: bound(text), pages: meta.pages, info: meta, processor: 'pdf-parse' }
+    return { text, pages: meta.pages, info: meta, processor: 'pdf-worker' }
   }
 
   if (ext === '.docx' || ext === '.doc') {

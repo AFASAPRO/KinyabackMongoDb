@@ -149,19 +149,52 @@ async function transcribeAudio({ filePath, signal }) {
   } catch (err) { throw normalizeError(err) } finally { cleanup() }
 }
 
-/* ── Text-to-speech ──────────────────────────────────────────── */
+/* ── Text-to-speech (Orpheus TTS) ──────────────────────────────
+   Tries the configured voice/format first, then degrades
+   gracefully: wav → mp3, and falls back to the default Orpheus
+   voice when the configured voice is rejected. Every attempt is
+   logged so administrators can see what the provider accepted. */
+const TTS_FALLBACK_VOICE = 'tara'
+
+async function ttsAttempt({ text, voice, format, signal }) {
+  const response = await getClient().audio.speech.create({
+    model: config.models.tts,
+    voice,
+    input: text,
+    response_format: format,
+  }, { signal })
+  const buffer = Buffer.from(await response.arrayBuffer())
+  if (!buffer.length) { const e = new Error('Empty audio'); e.code = 'TTS_EMPTY'; throw e }
+  return buffer
+}
+
 async function synthesizeSpeech({ text, signal }) {
   const { signal: timed, cleanup } = withTimeout(signal, config.limits.ttsTimeoutMs, 'Speech synthesis')
   try {
-    const response = await getClient().audio.speech.create({
-      model: config.models.tts,
-      voice: config.ttsVoice,
-      input: text,
-      response_format: 'wav',
-    }, { signal: timed })
-    const buffer = Buffer.from(await response.arrayBuffer())
-    if (!buffer.length) { const e = new Error('Empty audio'); e.code = 'TTS_EMPTY'; throw e }
-    return { buffer, model: config.models.tts }
+    let lastErr = null
+    // Attempt 1: configured voice + configured format (default wav)
+    try {
+      const buffer = await ttsAttempt({ text, voice: config.ttsVoice, format: config.ttsFormat, signal: timed })
+      return { buffer, model: config.models.tts, voice: config.ttsVoice, format: config.ttsFormat }
+    } catch (err) { lastErr = err }
+
+    // Attempt 2: same voice, alternate container (some builds only ship mp3)
+    const altFormat = config.ttsFormat === 'wav' ? 'mp3' : 'wav'
+    try {
+      const buffer = await ttsAttempt({ text, voice: config.ttsVoice, format: altFormat, signal: timed })
+      console.warn(`[TTS] primary format "${config.ttsFormat}" rejected, "${altFormat}" succeeded`)
+      return { buffer, model: config.models.tts, voice: config.ttsVoice, format: altFormat }
+    } catch (err) { lastErr = err }
+
+    // Attempt 3: default Orpheus voice (configured voice may not exist on the model)
+    if (config.ttsVoice !== TTS_FALLBACK_VOICE) {
+      try {
+        const buffer = await ttsAttempt({ text, voice: TTS_FALLBACK_VOICE, format: config.ttsFormat, signal: timed })
+        console.warn(`[TTS] voice "${config.ttsVoice}" rejected, fallback voice "${TTS_FALLBACK_VOICE}" succeeded`)
+        return { buffer, model: config.models.tts, voice: TTS_FALLBACK_VOICE, format: config.ttsFormat }
+      } catch (err) { lastErr = err }
+    }
+    throw lastErr
   } catch (err) { throw normalizeError(err) } finally { cleanup() }
 }
 

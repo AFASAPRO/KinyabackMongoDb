@@ -33,7 +33,9 @@ async function loadHistory(chatId, { excludeMessageId = null } = {}) {
 
 function trimToBudget(history, budgetTokens = config.context.tokenBudget) {
   const budgetChars = budgetTokens * CHARS_PER_TOKEN
-  let total = 0, cutoff = history.length
+  // Default: keep EVERYTHING (cutoff 0). Only when the newest-first
+  // accumulation exceeds the budget do we drop the oldest messages.
+  let total = 0, cutoff = 0
   for (let i = history.length - 1; i >= 0; i--) {
     total += (history[i].content || '').length
     if (total > budgetChars && history.length - i > 2) { cutoff = i + 1; break }
@@ -89,8 +91,39 @@ function findRecentDocumentContext(history) {
   return null
 }
 
+/* ── Recent image context (§18) ────────────────────────────────
+   Returns the most recently shared image attachment so follow-up
+   turns ("tell me more about this image") can re-attach it and
+   the model can actually SEE it instead of confabulating.        */
+function findRecentImageContext(history, { maxUserTurnsBack = 3 } = {}) {
+  let userTurnsSeen = 0
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i]
+    if (m.role !== 'user') continue
+    const imgAtt = (m.attachments || []).find(a => a.kind === 'image')
+    if (imgAtt) return { name: imgAtt.name || 'image', url: imgAtt.url, mime: imgAtt.mime || 'image/jpeg' }
+    userTurnsSeen++
+    if (userTurnsSeen >= maxUserTurnsBack) break
+  }
+  return null
+}
+
+/* Human-visible placeholder for attachment-only messages so the
+   model always knows a file was shared — empty content previously
+   vanished from history, which made the model answer blindly.    */
+function messageText(m) {
+  const text = (m.content || '').trim()
+  if (text) return text
+  const att = (m.attachments || [])[0]
+  if (!att) return ''
+  if (att.kind === 'image') return `[User shared an image: ${att.name || 'photo'}]`
+  if (att.kind === 'document')
+    return `[User shared a document: ${att.name || 'file'}${att.pages ? ` (${att.pages} pages)` : ''}]`
+  return `[User shared a file: ${att.name || 'attachment'}]`
+}
+
 /* ── Prompt assembly ─────────────────────────────────────────── */
-function buildMessages({ systemPrompt, memory, ragContext, history, summary, documentContext, userText, imageDataUrl }) {
+function buildMessages({ systemPrompt, memory, ragContext, history, summary, documentContext, userText, imageDataUrl, priorImage }) {
   const contextBlocks = []
   if (memory && Object.keys(memory).length) {
     contextBlocks.push(`User context: ${Object.entries(memory).map(([k, v]) => `${k}=${v}`).join(', ')}`)
@@ -101,6 +134,10 @@ function buildMessages({ systemPrompt, memory, ragContext, history, summary, doc
     const pages = documentContext.pages ? ` (${documentContext.pages} pages)` : ''
     contextBlocks.push(`[Attached document: ${documentContext.name}${pages}]\nThe user previously uploaded this document. Answer questions about it from this content; say clearly when something is not in the document.\n---\n${documentContext.text}\n---`)
   }
+  // Honesty guard (§6/§7): never pretend to see a file that is not in context.
+  contextBlocks.push(
+    'Attachment honesty: if the user refers to an image or document that is not present in your context, say clearly that you cannot see it right now and ask them to re-attach it. NEVER invent or describe a file you cannot see, and NEVER answer a question about an unseen attachment with a generic greeting.'
+  )
 
   const messages = []
   const sys = [systemPrompt?.trim(), contextBlocks.length ? contextBlocks.join('\n\n') : '']
@@ -108,38 +145,63 @@ function buildMessages({ systemPrompt, memory, ragContext, history, summary, doc
   if (sys) messages.push({ role: 'system', content: sys })
 
   for (const m of history) {
-    if (!['user', 'assistant'].includes(m.role) || !m.content?.trim()) continue
-    messages.push({ role: m.role, content: m.content.trim() })
+    if (!['user', 'assistant'].includes(m.role)) continue
+    const text = messageText(m)
+    if (!text) continue
+    messages.push({ role: m.role, content: text })
   }
 
-  // Final user turn (may carry an image → multimodal content parts).
-  // The trailing user message is dropped from history when an image is
-  // attached, otherwise its text would be sent twice (plain + multimodal).
+  // Final user turn. Three shapes:
+  //   1. new image this turn → multimodal parts (text + image)
+  //   2. follow-up about an earlier image → re-attach it (§18)
+  //   3. plain text (attachment-only turns get a default prompt so a
+  //      user turn ALWAYS exists — prevents greeting prefills)
+  const trimmedUserText = (userText || '').trim()
   if (imageDataUrl) {
     while (messages.length && messages[messages.length - 1].role === 'user') messages.pop()
     messages.push({
       role: 'user',
       content: [
-        { type: 'text', text: userText || 'What is in this image?' },
+        { type: 'text', text: trimmedUserText || 'What is in this image? Describe it in detail.' },
         { type: 'image_url', image_url: { url: imageDataUrl } },
       ],
     })
-  } else if (userText) {
+  } else if (priorImage?.dataUrl) {
+    while (messages.length && messages[messages.length - 1].role === 'user') messages.pop()
+    messages.push({
+      role: 'user',
+      content: [
+        { type: 'text', text: trimmedUserText || 'What is in this image? Describe it in detail.' },
+        { type: 'text', text: `(This is the image the user shared earlier in this conversation: ${priorImage.name})` },
+        { type: 'image_url', image_url: { url: priorImage.dataUrl } },
+      ],
+    })
+  } else if (trimmedUserText) {
     const last = messages[messages.length - 1]
-    if (last && last.role === 'user' && last.content === userText.trim()) {
+    if (last && last.role === 'user' && last.content === trimmedUserText) {
       // already appended via history — nothing to do
     } else {
-      messages.push({ role: 'user', content: userText })
+      // An attachment-only placeholder (e.g. "[User shared a document: …]")
+      // is replaced by the explicit request the caller synthesized.
+      if (last && last.role === 'user' && last.content.startsWith('[User shared')) messages.pop()
+      messages.push({ role: 'user', content: trimmedUserText })
     }
+  } else if (documentContext) {
+    // Attachment-only document turn: give the model an explicit request
+    const last = messages[messages.length - 1]
+    if (last && last.role === 'user' && last.content.startsWith('[User shared')) messages.pop()
+    messages.push({ role: 'user', content: 'Please read the attached document and tell me what it contains.' })
   }
+  // NOTE: never leave the transcript ending on a system/assistant
+  // message — some models prefill a greeting in that case.
 
   return messages
 }
 
-/* Choose the model for this turn (§4): vision when an image is
-   present, otherwise the configured chat model. */
-function pickModel({ imageDataUrl, documentUsed }) {
-  if (imageDataUrl) return config.models.vision
+/* Choose the model for this turn (§4): vision whenever the model can
+   actually see an image (new or re-attached), otherwise chat model. */
+function pickModel({ imageDataUrl, priorImage } = {}) {
+  if (imageDataUrl || priorImage?.dataUrl) return config.models.vision
   return config.models.chat
 }
 
@@ -148,6 +210,8 @@ module.exports = {
   trimToBudget,
   ensureSummary,
   findRecentDocumentContext,
+  findRecentImageContext,
+  messageText,
   buildMessages,
   pickModel,
   CHARS_PER_TOKEN,

@@ -621,7 +621,8 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
   const ragContext = cfg.knowledge_base_enabled ? await searchKnowledgeBase(kept[kept.length - 1]?.content || '') : '';
   const documentContext = chatService.findRecentDocumentContext(kept);
 
-  // Multimodal: image attached to the most recent user turn (§8)
+  // Multimodal: image attached to the most recent user turn (§8),
+  // or re-attached from earlier in the conversation for follow-ups (§18)
   const lastUser = [...kept].reverse().find(m => m.role === 'user');
   const imgAtt = lastUser?.attachments?.find(a => a.kind === 'image');
   let imageDataUrl = null;
@@ -637,13 +638,41 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
     }
   }
 
+  // Follow-up about an earlier image: re-attach the most recent one so
+  // the model can see it instead of inventing an answer (§18).
+  let priorImage = null;
+  if (!imageDataUrl) {
+    const priorAtt = chatService.findRecentImageContext(kept);
+    if (priorAtt) {
+      try {
+        const priorPath = priorAtt.url.replace('/uploads', './uploads');
+        const b64 = fs.readFileSync(priorPath).toString('base64');
+        priorImage = { name: priorAtt.name, dataUrl: `data:${priorAtt.mime || 'image/jpeg'};base64,${b64}` };
+      } catch (e) {
+        // File gone (ephemeral disk) — no re-attach; the honesty guard in
+        // the system prompt makes the model say it cannot see the image.
+        console.warn('[Stream] prior image unavailable:', e.message);
+      }
+    }
+  }
+
+  // Attachment-only turns must still carry a user request, otherwise the
+  // model receives a transcript with no trailing user message.
+  let userText = lastUser?.content || '';
+  if (!userText.trim() && !imageDataUrl && !priorImage) {
+    const att = lastUser?.attachments?.[0];
+    if (att?.kind === 'document') userText = 'Please read the attached document and tell me what it contains.';
+    else if (att) userText = 'Please tell me about the file I attached.';
+  }
+
   const messages = chatService.buildMessages({
     systemPrompt: cfg.system_prompt, memory, ragContext,
     history: kept, summary, documentContext,
-    userText: lastUser?.content || '',
+    userText,
     imageDataUrl,
+    priorImage,
   });
-  const model = chatService.pickModel({ imageDataUrl });
+  const model = chatService.pickModel({ imageDataUrl, priorImage });
 
   send('start', { streaming: true });
 
@@ -883,9 +912,9 @@ app.post('/api/tts', authGuard, async (req, res) => {
   const { text } = req.body;
   if (!text || !String(text).trim()) return res.status(400).json({ error: 'Text required.' });
   try {
-    const { buffer, model } = await speechService.synthesize(String(text));
+    const { buffer, model, format } = await speechService.synthesize(String(text));
     await trackUsage(req.user.id, null, estimateTokens(String(text)), 'tts', 0, true);
-    res.setHeader('Content-Type', 'audio/wav');
+    res.setHeader('Content-Type', format === 'mp3' ? 'audio/mpeg' : 'audio/wav');
     res.setHeader('X-TTS-Model', model);
     res.send(buffer);
   } catch (err) {
@@ -952,14 +981,26 @@ app.post('/api/chats/:id/messages', authGuard, uploadChat.single('file'), async 
     const ragCtx = cfg.knowledge_base_enabled && content ? await searchKnowledgeBase(content) : '';
     const documentContext = chatService.findRecentDocumentContext(kept);
 
-    // Vision turn (image understanding)
+    // Vision turn (image understanding — new attachment or re-attached prior image)
     let result;
-    if (prepared.imageDataUrl) {
+    let priorImage = null;
+    if (!prepared.imageDataUrl) {
+      const priorAtt = chatService.findRecentImageContext(kept);
+      if (priorAtt) {
+        try {
+          const priorPath = priorAtt.url.replace('/uploads', './uploads');
+          const b64 = fs.readFileSync(priorPath).toString('base64');
+          priorImage = { name: priorAtt.name, dataUrl: `data:${priorAtt.mime || 'image/jpeg'};base64,${b64}` };
+        } catch (e) { console.warn('[Message] prior image unavailable:', e.message); }
+      }
+    }
+
+    if (prepared.imageDataUrl || priorImage) {
       const historyText = kept.filter(m => !(String(m._id) === String(userMsg._id)) && m.content?.trim())
         .slice(-6).map(m => ({ role: m.role, content: m.content.trim() }));
       result = await provider.visionComplete({
-        prompt: content || 'What is in this image?',
-        imageDataUrl: prepared.imageDataUrl,
+        prompt: content || (prepared.imageDataUrl ? 'What is in this image? Describe it in detail.' : `Tell me more about this image (${priorImage.name}).`),
+        imageDataUrl: prepared.imageDataUrl || priorImage.dataUrl,
         history: historyText, systemPrompt: cfg.system_prompt,
         maxTokens: cfg.max_tokens, temperature: cfg.temperature,
       });

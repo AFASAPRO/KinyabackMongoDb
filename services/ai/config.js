@@ -33,9 +33,10 @@ const config = {
     vision:   env('GROQ_VISION_MODEL', 'meta-llama/llama-4-scout-17b-16e-instruct'),
     document: env('GROQ_DOCUMENT_MODEL', chatModel),
     stt:      env('GROQ_STT_MODEL',   'whisper-large-v3-turbo'),
-    tts:      env('GROQ_TTS_MODEL',   'playai-tts'),
+    tts:      env('GROQ_TTS_MODEL',   'canopylabs/orpheus-v1-english'),
   },
-  ttsVoice: env('GROQ_TTS_VOICE', 'Celeste-PlayAI'),
+  ttsVoice: env('GROQ_TTS_VOICE', 'tara'),
+  ttsFormat: env('GROQ_TTS_FORMAT', 'wav'),
 
   /* ── Context management (§5) ──────────────────────────────── */
   context: {

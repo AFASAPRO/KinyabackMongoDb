@@ -50,7 +50,9 @@ const attachmentSchema = new Schema({
 const messageSchema = new Schema({
   chat_id:       { type: Schema.Types.ObjectId, ref: 'Chat', required: true },
   role:          { type: String, enum: ['user', 'assistant'], required: true },
-  content:       { type: String, required: true },
+  // Empty content is allowed for attachment-only messages (image/document
+  // uploads without a caption); the UI renders just the attachment.
+  content:       { type: String, default: '' },
   file_url:      { type: String, default: null },            // legacy single-attachment field
   message_type:  { type: String, enum: ['text', 'image', 'document', 'audio'], default: 'text' },
   attachments:   { type: [attachmentSchema], default: [] },
