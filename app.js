@@ -1130,24 +1130,33 @@ app.post('/api/admin/login', async (req, res) => {
 });
 
 app.post('/api/admin/register', async (req, res) => {
-  const { username, email, password, invite_code, role = 'admin' } = req.body;
+  // Throttle registration attempts per IP (invite-code guessing protection)
+  const rl = rateLimiter.allow(String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || 'unknown', 'admin_register', { limit: 8, windowMs: 15 * 60 * 1000 });
+  if (!rl.ok) return rateLimiter.tooMany(res, rl.retryAfterSec);
+
+  const { password, invite_code, role } = req.body || {};
+  const username = String(req.body?.username || '').trim();
+  const email    = String(req.body?.email || '').trim().toLowerCase();
   if (!username || !email || !password) return res.status(400).json({ error: 'All fields required' });
   if (username.length < 3) return res.status(400).json({ error: 'Username min 3 chars' });
-  if (password.length < 8) return res.status(400).json({ error: 'Password min 8 chars' });
+  if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ error: 'Valid email required' });
+  if (String(password).length < 8) return res.status(400).json({ error: 'Password min 8 chars' });
   const INVITE_CODE = process.env.ADMIN_INVITE_CODE || 'KinyaBot-Admin-2024';
   try {
     const totalAdmins = await Admin.countDocuments();
-    if (totalAdmins > 0 && (invite_code || '').trim() !== INVITE_CODE)
-      return res.status(403).json({ error: `Invalid invite code. Use: ${INVITE_CODE}` });
-    const existing = await Admin.findOne({ $or: [{ email: email.toLowerCase() }, { username }] });
+    // Never reveal the invite code in the response
+    if (totalAdmins > 0 && String(invite_code || '').trim() !== INVITE_CODE)
+      return res.status(403).json({ error: 'Invalid invite code.' });
+    const existing = await Admin.findOne({ $or: [{ email }, { username }] });
     if (existing) return res.status(409).json({ error: 'Email or username already taken' });
-    const hash = await bcrypt.hash(password, 12);
-    const assignedRole = totalAdmins === 0 ? 'super_admin' : role;
-    const adm = await Admin.create({ username, email: email.toLowerCase(), password_hash: hash, role: assignedRole });
+    const hash = await bcrypt.hash(String(password), 12);
+    // Only the very first account is super_admin; invited accounts can never self-assign it
+    const assignedRole = totalAdmins === 0 ? 'super_admin' : (role === 'moderator' ? 'moderator' : 'admin');
+    const adm = await Admin.create({ username, email, password_hash: hash, role: assignedRole });
     const token = jwt.sign({ id: adm._id.toString(), username, email: adm.email, role: assignedRole, isAdmin: true }, ADMIN_SECRET, { expiresIn: '8h' });
     await sysLog('info', 'admin', `Admin registered: ${username}`);
     res.status(201).json({ token, admin: { id: adm._id.toString(), username, email: adm.email, role: assignedRole } });
-  } catch (err) { console.error('[AdminReg]', err); res.status(500).json({ error: 'Registration failed: ' + err.message }); }
+  } catch (err) { console.error('[AdminReg]', err); res.status(500).json({ error: 'Registration failed. Please try again.' }); }
 });
 
 /* ══════════════════════════════════════════════════════════════
