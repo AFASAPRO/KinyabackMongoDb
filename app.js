@@ -143,6 +143,50 @@ let cfg = {
 try { cfg = { ...cfg, ...JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')) }; } catch {}
 function saveCfg() { try { fs.writeFileSync(SETTINGS_FILE, JSON.stringify(cfg, null, 2)); } catch {} }
 
+/* ── ROLE / PERMISSION MATRIX ────────────────────────────────────
+   Granular per-role permissions for the Admin model's three roles.
+   super_admin always has every permission and is not editable — it's
+   the account type that manages everyone else's access.            */
+const PERMISSION_KEYS = [
+  { key: 'users',         label: 'Manage Users' },
+  { key: 'chats',         label: 'View/Delete Chats' },
+  { key: 'notifications', label: 'Broadcast Notifications' },
+  { key: 'knowledge',     label: 'Knowledge Base' },
+  { key: 'moderation',    label: 'Content Moderation' },
+  { key: 'analytics',     label: 'View Analytics' },
+  { key: 'logs',          label: 'System Logs' },
+  { key: 'security',      label: 'Security & Blocked IPs' },
+  { key: 'settings',      label: 'System Settings' },
+  { key: 'ai_config',     label: 'AI Configuration' },
+  { key: 'export',        label: 'Export Data' },
+  { key: 'admins',        label: 'Manage Admins & Roles' },
+];
+const DEFAULT_ROLE_PERMISSIONS = {
+  super_admin: PERMISSION_KEYS.reduce((o, p) => (o[p.key] = true, o), {}),
+  admin: {
+    users: true, chats: true, notifications: true, knowledge: true,
+    moderation: true, analytics: true, logs: false, security: false,
+    settings: false, ai_config: false, export: true, admins: false,
+  },
+  moderator: {
+    users: false, chats: true, notifications: false, knowledge: false,
+    moderation: true, analytics: true, logs: false, security: false,
+    settings: false, ai_config: false, export: false, admins: false,
+  },
+};
+if (!cfg.role_permissions) cfg.role_permissions = JSON.parse(JSON.stringify(DEFAULT_ROLE_PERMISSIONS));
+// super_admin is always fully-permissioned regardless of what's persisted
+cfg.role_permissions.super_admin = { ...DEFAULT_ROLE_PERMISSIONS.super_admin };
+function hasPermission(role, key) { return !!cfg.role_permissions?.[role]?.[key]; }
+// Route-level permission gate for non-super_admin roles (super_admin always passes).
+function requirePermission(key) {
+  return (req, res, next) => {
+    if (req.admin?.role === 'super_admin') return next();
+    if (hasPermission(req.admin?.role, key)) return next();
+    return res.status(403).json({ error: 'Your role does not have permission to do this.' });
+  };
+}
+
 /* ── EMAIL ───────────────────────────────────────────────────── */
 const mailer = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
@@ -184,6 +228,11 @@ function adminGuard(req, res, next) {
     if (!d.isAdmin) throw new Error();
     req.admin = d; next();
   } catch { res.status(403).json({ error: 'Admin access required' }); }
+}
+// Only super_admin may manage other admins' roles/permissions or create new admins.
+function requireSuperAdmin(req, res, next) {
+  if (req.admin?.role !== 'super_admin') return res.status(403).json({ error: 'Super admin access required' });
+  next();
 }
 app.use((req, res, next) => {
   if (cfg.blocked_ips?.includes(req.ip)) return res.status(403).json({ error: 'Access denied' });
@@ -1129,35 +1178,10 @@ app.post('/api/admin/login', async (req, res) => {
   } catch (err) { console.error('[AdminLogin]', err); res.status(500).json({ error: 'Login failed.' }); }
 });
 
-app.post('/api/admin/register', async (req, res) => {
-  // Throttle registration attempts per IP (invite-code guessing protection)
-  const rl = rateLimiter.allow(String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || 'unknown', 'admin_register', { limit: 8, windowMs: 15 * 60 * 1000 });
-  if (!rl.ok) return rateLimiter.tooMany(res, rl.retryAfterSec);
-
-  const { password, invite_code, role } = req.body || {};
-  const username = String(req.body?.username || '').trim();
-  const email    = String(req.body?.email || '').trim().toLowerCase();
-  if (!username || !email || !password) return res.status(400).json({ error: 'All fields required' });
-  if (username.length < 3) return res.status(400).json({ error: 'Username min 3 chars' });
-  if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ error: 'Valid email required' });
-  if (String(password).length < 8) return res.status(400).json({ error: 'Password min 8 chars' });
-  const INVITE_CODE = process.env.ADMIN_INVITE_CODE || 'KinyaBot-Admin-2024';
-  try {
-    const totalAdmins = await Admin.countDocuments();
-    // Never reveal the invite code in the response
-    if (totalAdmins > 0 && String(invite_code || '').trim() !== INVITE_CODE)
-      return res.status(403).json({ error: 'Invalid invite code.' });
-    const existing = await Admin.findOne({ $or: [{ email }, { username }] });
-    if (existing) return res.status(409).json({ error: 'Email or username already taken' });
-    const hash = await bcrypt.hash(String(password), 12);
-    // Only the very first account is super_admin; invited accounts can never self-assign it
-    const assignedRole = totalAdmins === 0 ? 'super_admin' : (role === 'moderator' ? 'moderator' : 'admin');
-    const adm = await Admin.create({ username, email, password_hash: hash, role: assignedRole });
-    const token = jwt.sign({ id: adm._id.toString(), username, email: adm.email, role: assignedRole, isAdmin: true }, ADMIN_SECRET, { expiresIn: '8h' });
-    await sysLog('info', 'admin', `Admin registered: ${username}`);
-    res.status(201).json({ token, admin: { id: adm._id.toString(), username, email: adm.email, role: assignedRole } });
-  } catch (err) { console.error('[AdminReg]', err); res.status(500).json({ error: 'Registration failed. Please try again.' }); }
-});
+// NOTE: public self-registration has been removed for security — the very
+// first super_admin is created via `node setup-admin.js`, and every admin
+// after that is created from the dashboard by an existing super_admin
+// (see POST /api/admin/admins below).
 
 /* ══════════════════════════════════════════════════════════════
    ADMIN — DASHBOARD & ANALYTICS
@@ -1413,7 +1437,7 @@ app.delete('/api/admin/notifications/:id', adminGuard, async (req, res) => {
 
 /* ── SETTINGS ────────────────────────────────────────────────── */
 app.get('/api/admin/settings', adminGuard, (_, res) => res.json({ ...cfg, groq_model: process.env.GROQ_MODEL || DEFAULT_MODEL }));
-app.put('/api/admin/settings', adminGuard, async (req, res) => {
+app.put('/api/admin/settings', adminGuard, requirePermission('settings'), async (req, res) => {
   try {
     const allowedSettings = [
       'max_tokens', 'temperature', 'system_prompt', 'image_gen_enabled',
@@ -1477,7 +1501,7 @@ app.get('/api/admin/moderation', adminGuard, async (req, res) => {
   } catch { res.json([]); }
 });
 
-app.put('/api/admin/moderation/:id/review', adminGuard, async (req, res) => {
+app.put('/api/admin/moderation/:id/review', adminGuard, requirePermission('moderation'), async (req, res) => {
   try { await FlaggedContent.findByIdAndUpdate(req.params.id, { reviewed: true }); res.json({ success: true }); }
   catch { res.status(500).json({ error: 'Failed' }); }
 });
@@ -1488,7 +1512,7 @@ app.get('/api/admin/knowledge', adminGuard, async (req, res) => {
   catch { res.json([]); }
 });
 
-app.post('/api/admin/knowledge', adminGuard, upload.single('file'), async (req, res) => {
+app.post('/api/admin/knowledge', adminGuard, requirePermission('knowledge'), upload.single('file'), async (req, res) => {
   const { title, content } = req.body;
   if (!title) return res.status(400).json({ error: 'Title required' });
   try {
@@ -1506,7 +1530,7 @@ app.post('/api/admin/knowledge', adminGuard, upload.single('file'), async (req, 
   } catch { res.status(500).json({ error: 'Failed to add knowledge' }); }
 });
 
-app.delete('/api/admin/knowledge/:id', adminGuard, async (req, res) => {
+app.delete('/api/admin/knowledge/:id', adminGuard, requirePermission('knowledge'), async (req, res) => {
   try { await KnowledgeBase.findByIdAndDelete(req.params.id); res.json({ success: true }); }
   catch { res.status(500).json({ error: 'Failed' }); }
 });
@@ -1555,7 +1579,7 @@ app.get('/api/admin/visitors', adminGuard, async (req, res) => {
 });
 
 /* ── LOGS ────────────────────────────────────────────────────── */
-app.get('/api/admin/logs', adminGuard, async (req, res) => {
+app.get('/api/admin/logs', adminGuard, requirePermission('logs'), async (req, res) => {
   const { level, page = 1, limit = 50 } = req.query;
   const skip = (parseInt(page) - 1) * parseInt(limit);
   try {
@@ -1569,7 +1593,7 @@ app.get('/api/admin/logs', adminGuard, async (req, res) => {
 });
 
 /* ── SECURITY ────────────────────────────────────────────────── */
-app.get('/api/admin/security', adminGuard, async (req, res) => {
+app.get('/api/admin/security', adminGuard, requirePermission('security'), async (req, res) => {
   try {
     const suspicious = await PageView.aggregate([
       { $match: { ip_address: { $ne: null } } },
@@ -1581,7 +1605,7 @@ app.get('/api/admin/security', adminGuard, async (req, res) => {
   } catch { res.json({ blocked_ips: [], suspicious: [] }); }
 });
 
-app.post('/api/admin/security/block-ip', adminGuard, async (req, res) => {
+app.post('/api/admin/security/block-ip', adminGuard, requirePermission('security'), async (req, res) => {
   const { ip } = req.body;
   if (!ip) return res.status(400).json({ error: 'IP required' });
   try {
@@ -1592,27 +1616,103 @@ app.post('/api/admin/security/block-ip', adminGuard, async (req, res) => {
   } catch { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.delete('/api/admin/security/block-ip/:ip', adminGuard, async (req, res) => {
+app.delete('/api/admin/security/block-ip/:ip', adminGuard, requirePermission('security'), async (req, res) => {
   try {
     cfg.blocked_ips = (cfg.blocked_ips || []).filter(i => i !== req.params.ip);
     saveCfg(); res.json({ success: true });
   } catch { res.status(500).json({ error: 'Failed' }); }
 });
 
-/* ── ADMINS LIST ─────────────────────────────────────────────── */
+/* ── ADMINS — LIST, CREATE, ROLE & PERMISSION MANAGEMENT ────────
+   Only super_admin can create admins, change roles, delete admins,
+   or edit the role→permission matrix. Any authenticated admin can
+   view the admins list and the (read-only) permission matrix.     */
 app.get('/api/admin/admins', adminGuard, async (req, res) => {
   try { res.json(fmtArr(await Admin.find().select('username email role created_at last_login').sort({ created_at: 1 }).lean())); }
   catch { res.json([]); }
 });
 
-app.delete('/api/admin/admins/:id', adminGuard, async (req, res) => {
+// Create a new admin account directly from the dashboard (replaces the old public register page).
+app.post('/api/admin/admins', adminGuard, requireSuperAdmin, async (req, res) => {
+  const username = String(req.body?.username || '').trim();
+  const email    = String(req.body?.email || '').trim().toLowerCase();
+  const password = String(req.body?.password || '');
+  const role     = ['super_admin', 'admin', 'moderator'].includes(req.body?.role) ? req.body.role : 'admin';
+  if (!username || !email || !password) return res.status(400).json({ error: 'All fields required' });
+  if (username.length < 3) return res.status(400).json({ error: 'Username min 3 chars' });
+  if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ error: 'Valid email required' });
+  if (password.length < 8) return res.status(400).json({ error: 'Password min 8 chars' });
+  try {
+    const existing = await Admin.findOne({ $or: [{ email }, { username }] });
+    if (existing) return res.status(409).json({ error: 'Email or username already taken' });
+    const hash = await bcrypt.hash(password, 12);
+    const adm = await Admin.create({ username, email, password_hash: hash, role });
+    await sysLog('info', 'admin', `Admin "${username}" (${role}) created by ${req.admin.username}`);
+    res.status(201).json({ id: adm._id.toString(), username, email, role, success: true });
+  } catch (err) { console.error('[AdminCreate]', err); res.status(500).json({ error: 'Failed to create admin' }); }
+});
+
+// Change an existing admin's role.
+app.put('/api/admin/admins/:id/role', adminGuard, requireSuperAdmin, async (req, res) => {
+  const { role } = req.body || {};
+  if (!['super_admin', 'admin', 'moderator'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
+  if (req.admin.id === req.params.id) return res.status(400).json({ error: 'You cannot change your own role' });
+  try {
+    const target = await Admin.findById(req.params.id);
+    if (!target) return res.status(404).json({ error: 'Admin not found' });
+    if (target.role === 'super_admin' && role !== 'super_admin') {
+      const superAdminCount = await Admin.countDocuments({ role: 'super_admin' });
+      if (superAdminCount <= 1) return res.status(400).json({ error: 'Cannot demote the last super admin' });
+    }
+    target.role = role;
+    await target.save();
+    await sysLog('warn', 'admin', `${req.admin.username} changed ${target.username}'s role to ${role}`);
+    res.json({ success: true, id: target._id.toString(), role: target.role });
+  } catch { res.status(500).json({ error: 'Failed to update role' }); }
+});
+
+app.delete('/api/admin/admins/:id', adminGuard, requireSuperAdmin, async (req, res) => {
   if (req.admin.id === req.params.id) return res.status(400).json({ error: 'Cannot delete yourself' });
-  try { await Admin.findByIdAndDelete(req.params.id); res.json({ success: true }); }
-  catch { res.status(500).json({ error: 'Failed' }); }
+  try {
+    const target = await Admin.findById(req.params.id);
+    if (target?.role === 'super_admin') {
+      const superAdminCount = await Admin.countDocuments({ role: 'super_admin' });
+      if (superAdminCount <= 1) return res.status(400).json({ error: 'Cannot delete the last super admin' });
+    }
+    await Admin.findByIdAndDelete(req.params.id);
+    await sysLog('warn', 'admin', `${req.admin.username} deleted admin ${target?.username || req.params.id}`);
+    res.json({ success: true });
+  } catch { res.status(500).json({ error: 'Failed' }); }
+});
+
+/* ── ROLE → PERMISSION MATRIX ─────────────────────────────────── */
+app.get('/api/admin/role-permissions', adminGuard, async (req, res) => {
+  res.json({
+    permission_keys: PERMISSION_KEYS,
+    role_permissions: cfg.role_permissions,
+    editable: req.admin.role === 'super_admin',
+  });
+});
+
+app.put('/api/admin/role-permissions', adminGuard, requireSuperAdmin, async (req, res) => {
+  const incoming = req.body?.role_permissions || {};
+  try {
+    for (const role of ['admin', 'moderator']) {
+      if (!incoming[role]) continue;
+      const next = {};
+      for (const p of PERMISSION_KEYS) next[p.key] = !!incoming[role][p.key];
+      cfg.role_permissions[role] = next;
+    }
+    // super_admin permissions are never editable — always full access
+    cfg.role_permissions.super_admin = { ...DEFAULT_ROLE_PERMISSIONS.super_admin };
+    saveCfg();
+    await sysLog('info', 'admin', `Role permissions updated by ${req.admin.username}`);
+    res.json({ success: true, role_permissions: cfg.role_permissions });
+  } catch { res.status(500).json({ error: 'Failed to save permissions' }); }
 });
 
 /* ── EXPORT ──────────────────────────────────────────────────── */
-app.get('/api/admin/export/users', adminGuard, async (req, res) => {
+app.get('/api/admin/export/users', adminGuard, requirePermission('export'), async (req, res) => {
   try {
     const users = await User.find().select('username email profession referral_source onboarded is_banned created_at last_login').sort({ created_at: -1 }).lean();
     res.setHeader('Content-Type', 'text/csv');
@@ -1623,7 +1723,7 @@ app.get('/api/admin/export/users', adminGuard, async (req, res) => {
   } catch { res.status(500).json({ error: 'Export failed' }); }
 });
 
-app.get('/api/admin/export/chats', adminGuard, async (req, res) => {
+app.get('/api/admin/export/chats', adminGuard, requirePermission('export'), async (req, res) => {
   try {
     const chats = await Chat.find().populate('user_id', 'username email').sort({ created_at: -1 }).lean();
     const enriched = await Promise.all(chats.map(async c => ({
