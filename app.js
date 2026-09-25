@@ -1643,16 +1643,28 @@ app.post('/api/admin/admins', adminGuard, requireSuperAdmin, async (req, res) =>
   if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ error: 'Valid email required' });
   if (password.length < 8) return res.status(400).json({ error: 'Password min 8 chars' });
   try {
-    const existing = await Admin.findOne({ $or: [{ email }, { username }] });
+    // Case-insensitive check — Mongo's unique index on email is exact-match only,
+    // so without this a differently-cased duplicate would slip past here and
+    // throw a raw E11000 error instead of a clean 409.
+    const existing = await Admin.findOne({
+      $or: [{ email }, { username: new RegExp(`^${username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }]
+    });
     if (existing) return res.status(409).json({ error: 'Email or username already taken' });
-    const hash = await bcrypt.hash(password, 12);
+    let hash;
+    try { hash = await bcrypt.hash(password, 12); }
+    catch (hashErr) { console.error('[AdminCreate:hash]', hashErr); return res.status(500).json({ error: 'Could not secure the password. Please try again.' }); }
     const adm = await Admin.create({ username, email, password_hash: hash, role });
     await sysLog('info', 'admin', `Admin "${username}" (${role}) created by ${req.admin.username}`);
-    res.status(201).json({ id: adm._id.toString(), username, email, role, success: true });
-  } catch (err) { console.error('[AdminCreate]', err); res.status(500).json({ error: 'Failed to create admin' }); }
+    return res.status(201).json({ id: adm._id.toString(), username, email, role, success: true });
+  } catch (err) {
+    console.error('[AdminCreate]', err);
+    if (err?.code === 11000) return res.status(409).json({ error: 'Email or username already taken' });
+    if (err?.name === 'ValidationError') return res.status(400).json({ error: Object.values(err.errors)[0]?.message || 'Invalid admin data' });
+    return res.status(500).json({ error: 'Failed to create admin. Please try again.' });
+  }
 });
 
-// Change an existing admin's role.
+// Change an existing admin's role (this is also how an existing admin gets promoted to super_admin).
 app.put('/api/admin/admins/:id/role', adminGuard, requireSuperAdmin, async (req, res) => {
   const { role } = req.body || {};
   if (!['super_admin', 'admin', 'moderator'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
@@ -1664,11 +1676,17 @@ app.put('/api/admin/admins/:id/role', adminGuard, requireSuperAdmin, async (req,
       const superAdminCount = await Admin.countDocuments({ role: 'super_admin' });
       if (superAdminCount <= 1) return res.status(400).json({ error: 'Cannot demote the last super admin' });
     }
+    // Promoting to super_admin (or any other valid role change) is otherwise unrestricted.
     target.role = role;
     await target.save();
     await sysLog('warn', 'admin', `${req.admin.username} changed ${target.username}'s role to ${role}`);
-    res.json({ success: true, id: target._id.toString(), role: target.role });
-  } catch { res.status(500).json({ error: 'Failed to update role' }); }
+    return res.json({ success: true, id: target._id.toString(), role: target.role });
+  } catch (err) {
+    console.error('[AdminRoleChange]', err);
+    if (err?.name === 'CastError') return res.status(400).json({ error: 'Invalid admin id' });
+    if (err?.name === 'ValidationError') return res.status(400).json({ error: Object.values(err.errors)[0]?.message || 'Invalid role data' });
+    return res.status(500).json({ error: 'Failed to update role. Please try again.' });
+  }
 });
 
 app.delete('/api/admin/admins/:id', adminGuard, requireSuperAdmin, async (req, res) => {
