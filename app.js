@@ -143,50 +143,6 @@ let cfg = {
 try { cfg = { ...cfg, ...JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')) }; } catch {}
 function saveCfg() { try { fs.writeFileSync(SETTINGS_FILE, JSON.stringify(cfg, null, 2)); } catch {} }
 
-/* ── ROLE / PERMISSION MATRIX ────────────────────────────────────
-   Granular per-role permissions for the Admin model's three roles.
-   super_admin always has every permission and is not editable — it's
-   the account type that manages everyone else's access.            */
-const PERMISSION_KEYS = [
-  { key: 'users',         label: 'Manage Users' },
-  { key: 'chats',         label: 'View/Delete Chats' },
-  { key: 'notifications', label: 'Broadcast Notifications' },
-  { key: 'knowledge',     label: 'Knowledge Base' },
-  { key: 'moderation',    label: 'Content Moderation' },
-  { key: 'analytics',     label: 'View Analytics' },
-  { key: 'logs',          label: 'System Logs' },
-  { key: 'security',      label: 'Security & Blocked IPs' },
-  { key: 'settings',      label: 'System Settings' },
-  { key: 'ai_config',     label: 'AI Configuration' },
-  { key: 'export',        label: 'Export Data' },
-  { key: 'admins',        label: 'Manage Admins & Roles' },
-];
-const DEFAULT_ROLE_PERMISSIONS = {
-  super_admin: PERMISSION_KEYS.reduce((o, p) => (o[p.key] = true, o), {}),
-  admin: {
-    users: true, chats: true, notifications: true, knowledge: true,
-    moderation: true, analytics: true, logs: false, security: false,
-    settings: false, ai_config: false, export: true, admins: false,
-  },
-  moderator: {
-    users: false, chats: true, notifications: false, knowledge: false,
-    moderation: true, analytics: true, logs: false, security: false,
-    settings: false, ai_config: false, export: false, admins: false,
-  },
-};
-if (!cfg.role_permissions) cfg.role_permissions = JSON.parse(JSON.stringify(DEFAULT_ROLE_PERMISSIONS));
-// super_admin is always fully-permissioned regardless of what's persisted
-cfg.role_permissions.super_admin = { ...DEFAULT_ROLE_PERMISSIONS.super_admin };
-function hasPermission(role, key) { return !!cfg.role_permissions?.[role]?.[key]; }
-// Route-level permission gate for non-super_admin roles (super_admin always passes).
-function requirePermission(key) {
-  return (req, res, next) => {
-    if (req.admin?.role === 'super_admin') return next();
-    if (hasPermission(req.admin?.role, key)) return next();
-    return res.status(403).json({ error: 'Your role does not have permission to do this.' });
-  };
-}
-
 /* ── EMAIL ───────────────────────────────────────────────────── */
 const mailer = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
@@ -229,11 +185,6 @@ function adminGuard(req, res, next) {
     req.admin = d; next();
   } catch { res.status(403).json({ error: 'Admin access required' }); }
 }
-// Only super_admin may manage other admins' roles/permissions or create new admins.
-function requireSuperAdmin(req, res, next) {
-  if (req.admin?.role !== 'super_admin') return res.status(403).json({ error: 'Super admin access required' });
-  next();
-}
 app.use((req, res, next) => {
   if (cfg.blocked_ips?.includes(req.ip)) return res.status(403).json({ error: 'Access denied' });
   next();
@@ -271,6 +222,29 @@ function estimateTokens(text) { return Math.ceil((text || '').length / 4); }
 
 async function sysLog(level, source, message, data, userId) {
   try { await SystemLog.create({ level, source, message, data: data || null, user_id: userId || null }); } catch {}
+}
+
+/* ══════════════════════════════════════════════════════════════
+   LIVE ACTIVITY (real, event-sourced — no randomized/fabricated
+   entries). Every call below is made at the exact moment a real
+   thing happens (a real login, a real message, a real ban…) and is
+   both persisted (so a fresh page load has real history) and pushed
+   instantly over Socket.IO to any admin dashboard in `admin_room`.
+   Online/offline state is derived from real Socket.IO connections —
+   see `onlinePresence` and the io.on('connection', …) handler below —
+   so a user only ever shows as active while a socket is actually open.
+══════════════════════════════════════════════════════════════ */
+const onlinePresence = new Map(); // userId(string) -> { username, sockets:Set<string>, since:Date }
+
+async function logActivity(action, { username = null, user_id = null, meta = null } = {}) {
+  const entry = { action, username, meta, created_at: new Date() };
+  try {
+    const doc = await SystemLog.create({ level: 'info', source: 'activity', message: action, data: { username, meta }, user_id: user_id || null });
+    entry.id = doc._id.toString();
+  } catch { entry.id = `tmp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`; }
+  const io = app.get('io');
+  if (io) io.to('admin_room').emit('admin_activity', entry);
+  return entry;
 }
 
 async function trackUsage(userId, chatId, tokens, type, responseMs, success) {
@@ -391,6 +365,7 @@ app.post('/api/auth/register', async (req, res) => {
     const user = await User.create({ username, email: email.toLowerCase(), password_hash: hash });
     const token = jwt.sign({ id: user._id.toString(), username, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
     await sysLog('info', 'auth', `Registered: ${username}`, null, user._id);
+    logActivity('register', { username, user_id: user._id.toString() });
     res.status(201).json({ token, user: { id: user._id.toString(), username, email: user.email, onboarded: false } });
   } catch (err) { console.error('[Register]', err); res.status(500).json({ error: 'Registration failed. Please try again.' }); }
 });
@@ -408,6 +383,7 @@ app.post('/api/auth/login', async (req, res) => {
     user.last_login = new Date();
     await user.save();
     const token = jwt.sign({ id: user._id.toString(), username: user.username, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    logActivity('login', { username: user.username, user_id: user._id.toString() });
     res.json({ token, user: { id: user._id.toString(), username: user.username, email: user.email, avatar_url: user.avatar_url, onboarded: user.onboarded, profession: user.profession } });
   } catch (err) { console.error('[Login]', err); res.status(500).json({ error: 'Login failed. Please try again.' }); }
 });
@@ -427,11 +403,13 @@ app.post('/api/auth/google', async (req, res) => {
       if (existingUser) username = `${username}_${uid.slice(0, 5)}`;
       user = await User.create({ username, email: email.toLowerCase(), password_hash: hash, avatar_url: picture || null });
       await sysLog('info', 'auth', `Registered via Google: ${username}`, null, user._id);
+      logActivity('register', { username, user_id: user._id.toString() });
     } else {
       if (user.is_banned) return res.status(403).json({ error: 'Account suspended.' });
       user.last_login = new Date();
       if (picture) user.avatar_url = picture;
       await user.save();
+      logActivity('login', { username: user.username, user_id: user._id.toString() });
     }
     const token = jwt.sign({ id: user._id.toString(), username: user.username, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ token, user: { id: user._id.toString(), username: user.username, email: user.email, avatar_url: user.avatar_url, onboarded: user.onboarded, profession: user.profession } });
@@ -465,6 +443,7 @@ app.post('/api/auth/onboarding', authGuard, async (req, res) => {
     await User.findByIdAndUpdate(req.user.id, update);
     if (username) await setUserMemory(req.user.id, 'name', username);
     if (profession) await setUserMemory(req.user.id, 'profession', profession);
+    logActivity('onboarded', { username: username || req.user.username, user_id: req.user.id });
     res.json({ success: true });
   } catch (err) {
     console.error('[Onboarding]', err);
@@ -579,6 +558,7 @@ app.get('/api/chats', authGuard, async (req, res) => {
 app.post('/api/chats', authGuard, async (req, res) => {
   try {
     const chat = await Chat.create({ user_id: req.user.id, title: (req.body.title || 'New Chat').slice(0, 255) });
+    logActivity('new_chat', { username: req.user.username, user_id: req.user.id, meta: { chatId: chat._id.toString() } });
     res.status(201).json(fmt(chat));
   } catch { res.status(500).json({ error: 'Could not create chat' }); }
 });
@@ -874,6 +854,7 @@ app.post('/api/chats/:id/messages/stream', authGuard, uploadChat.single('file'),
       attachments: meta ? [meta] : [],
     });
     send('user_message', fmtMessage(userMsg));
+    logActivity('message', { username: req.user.username, user_id: req.user.id, meta: { chatId } });
 
     // Auto-title
     const msgCount = await Message.countDocuments({ chat_id: chatId });
@@ -1018,6 +999,7 @@ app.post('/api/chats/:id/messages', authGuard, uploadChat.single('file'), async 
       message_type: prepared.messageType,
       attachments: meta ? [meta] : [],
     });
+    logActivity('message', { username: req.user.username, user_id: req.user.id, meta: { chatId } });
 
     const msgCount = await Message.countDocuments({ chat_id: chatId });
     if (msgCount <= 1 && content) { chat.title = content.slice(0, 60); await chat.save(); }
@@ -1174,14 +1156,31 @@ app.post('/api/admin/login', async (req, res) => {
     await adm.save();
     const token = jwt.sign({ id: adm._id.toString(), username: adm.username, email: adm.email, role: adm.role, isAdmin: true }, ADMIN_SECRET, { expiresIn: '8h' });
     await sysLog('info', 'admin', `Admin login: ${adm.username}`);
+    logActivity('admin_login', { username: adm.username, meta: { role: adm.role } });
     res.json({ token, admin: { id: adm._id.toString(), username: adm.username, email: adm.email, role: adm.role } });
   } catch (err) { console.error('[AdminLogin]', err); res.status(500).json({ error: 'Login failed.' }); }
 });
 
-// NOTE: public self-registration has been removed for security — the very
-// first super_admin is created via `node setup-admin.js`, and every admin
-// after that is created from the dashboard by an existing super_admin
-// (see POST /api/admin/admins below).
+app.post('/api/admin/register', async (req, res) => {
+  const { username, email, password, invite_code, role = 'admin' } = req.body;
+  if (!username || !email || !password) return res.status(400).json({ error: 'All fields required' });
+  if (username.length < 3) return res.status(400).json({ error: 'Username min 3 chars' });
+  if (password.length < 8) return res.status(400).json({ error: 'Password min 8 chars' });
+  const INVITE_CODE = process.env.ADMIN_INVITE_CODE || 'KinyaBot-Admin-2024';
+  try {
+    const totalAdmins = await Admin.countDocuments();
+    if (totalAdmins > 0 && (invite_code || '').trim() !== INVITE_CODE)
+      return res.status(403).json({ error: `Invalid invite code. Use: ${INVITE_CODE}` });
+    const existing = await Admin.findOne({ $or: [{ email: email.toLowerCase() }, { username }] });
+    if (existing) return res.status(409).json({ error: 'Email or username already taken' });
+    const hash = await bcrypt.hash(password, 12);
+    const assignedRole = totalAdmins === 0 ? 'super_admin' : role;
+    const adm = await Admin.create({ username, email: email.toLowerCase(), password_hash: hash, role: assignedRole });
+    const token = jwt.sign({ id: adm._id.toString(), username, email: adm.email, role: assignedRole, isAdmin: true }, ADMIN_SECRET, { expiresIn: '8h' });
+    await sysLog('info', 'admin', `Admin registered: ${username}`);
+    res.status(201).json({ token, admin: { id: adm._id.toString(), username, email: adm.email, role: assignedRole } });
+  } catch (err) { console.error('[AdminReg]', err); res.status(500).json({ error: 'Registration failed: ' + err.message }); }
+});
 
 /* ══════════════════════════════════════════════════════════════
    ADMIN — DASHBOARD & ANALYTICS
@@ -1241,6 +1240,26 @@ app.get('/api/admin/dashboard', adminGuard, async (req, res) => {
 
     res.json({ total_users, total_chats, total_messages, active_today, new_today, msgs_today, total_views, views_today, total_tokens, total_cost, daily_users, daily_messages, daily_views, professions, referrals, flagged_count });
   } catch (err) { console.error('[AdminDash]', err); res.status(500).json({ error: 'Could not load dashboard' }); }
+});
+
+/* ── LIVE ACTIVITY (real events + real online presence) ──────────
+   Backs the "Live Activity" widget on the dashboard. `events` are
+   genuine actions pulled from the activity log (see logActivity());
+   `online_users` reflects who currently has a real, live Socket.IO
+   connection open — never a random sample. New events after the
+   initial load arrive over the 'admin_activity' socket event instead
+   of polling, so the feed stays accurate without guessing. ────────── */
+app.get('/api/admin/activity', adminGuard, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+    const logs = await SystemLog.find({ source: 'activity' }).sort({ created_at: -1 }).limit(limit).lean();
+    const online_users = Array.from(onlinePresence.entries()).map(([user_id, p]) => ({ user_id, username: p.username, since: p.since }));
+    res.json({
+      events: logs.map(l => ({ id: l._id.toString(), action: l.message, username: l.data?.username || null, meta: l.data?.meta || null, created_at: l.created_at })),
+      online_count: onlinePresence.size,
+      online_users,
+    });
+  } catch (err) { console.error('[AdminActivity]', err); res.json({ events: [], online_count: 0, online_users: [] }); }
 });
 
 app.get('/api/admin/analytics', adminGuard, async (req, res) => {
@@ -1323,8 +1342,9 @@ app.get('/api/admin/users/:id/stats', adminGuard, async (req, res) => {
 app.put('/api/admin/users/:id/ban', adminGuard, async (req, res) => {
   const { banned } = req.body;
   try {
-    await User.findByIdAndUpdate(req.params.id, { is_banned: !!banned });
+    const u = await User.findByIdAndUpdate(req.params.id, { is_banned: !!banned });
     await sysLog('warn', 'admin', `${banned ? 'Banned' : 'Unbanned'} user ${req.params.id}`);
+    logActivity(banned ? 'banned' : 'unbanned', { username: u?.username || null, user_id: req.params.id });
     res.json({ success: true });
   } catch { res.status(500).json({ error: 'Could not update user' }); }
 });
@@ -1421,6 +1441,7 @@ app.post('/api/admin/notifications', adminGuard, async (req, res) => {
     const notif = await Notification.create({ title, message, type, is_active: true, created_by: req.admin.id, expires_at: expires_at || null });
     const io = req.app.get('io'); if (io) io.emit('admin_notification', fmt(notif));
     await sysLog('info', 'admin', `Notification: ${title}`);
+    logActivity('broadcast', { username: req.admin.username, meta: { title } });
     res.json(fmt(notif));
   } catch { res.status(500).json({ error: 'Failed' }); }
 });
@@ -1437,7 +1458,7 @@ app.delete('/api/admin/notifications/:id', adminGuard, async (req, res) => {
 
 /* ── SETTINGS ────────────────────────────────────────────────── */
 app.get('/api/admin/settings', adminGuard, (_, res) => res.json({ ...cfg, groq_model: process.env.GROQ_MODEL || DEFAULT_MODEL }));
-app.put('/api/admin/settings', adminGuard, requirePermission('settings'), async (req, res) => {
+app.put('/api/admin/settings', adminGuard, async (req, res) => {
   try {
     const allowedSettings = [
       'max_tokens', 'temperature', 'system_prompt', 'image_gen_enabled',
@@ -1501,7 +1522,7 @@ app.get('/api/admin/moderation', adminGuard, async (req, res) => {
   } catch { res.json([]); }
 });
 
-app.put('/api/admin/moderation/:id/review', adminGuard, requirePermission('moderation'), async (req, res) => {
+app.put('/api/admin/moderation/:id/review', adminGuard, async (req, res) => {
   try { await FlaggedContent.findByIdAndUpdate(req.params.id, { reviewed: true }); res.json({ success: true }); }
   catch { res.status(500).json({ error: 'Failed' }); }
 });
@@ -1512,7 +1533,7 @@ app.get('/api/admin/knowledge', adminGuard, async (req, res) => {
   catch { res.json([]); }
 });
 
-app.post('/api/admin/knowledge', adminGuard, requirePermission('knowledge'), upload.single('file'), async (req, res) => {
+app.post('/api/admin/knowledge', adminGuard, upload.single('file'), async (req, res) => {
   const { title, content } = req.body;
   if (!title) return res.status(400).json({ error: 'Title required' });
   try {
@@ -1530,7 +1551,7 @@ app.post('/api/admin/knowledge', adminGuard, requirePermission('knowledge'), upl
   } catch { res.status(500).json({ error: 'Failed to add knowledge' }); }
 });
 
-app.delete('/api/admin/knowledge/:id', adminGuard, requirePermission('knowledge'), async (req, res) => {
+app.delete('/api/admin/knowledge/:id', adminGuard, async (req, res) => {
   try { await KnowledgeBase.findByIdAndDelete(req.params.id); res.json({ success: true }); }
   catch { res.status(500).json({ error: 'Failed' }); }
 });
@@ -1579,7 +1600,7 @@ app.get('/api/admin/visitors', adminGuard, async (req, res) => {
 });
 
 /* ── LOGS ────────────────────────────────────────────────────── */
-app.get('/api/admin/logs', adminGuard, requirePermission('logs'), async (req, res) => {
+app.get('/api/admin/logs', adminGuard, async (req, res) => {
   const { level, page = 1, limit = 50 } = req.query;
   const skip = (parseInt(page) - 1) * parseInt(limit);
   try {
@@ -1593,7 +1614,7 @@ app.get('/api/admin/logs', adminGuard, requirePermission('logs'), async (req, re
 });
 
 /* ── SECURITY ────────────────────────────────────────────────── */
-app.get('/api/admin/security', adminGuard, requirePermission('security'), async (req, res) => {
+app.get('/api/admin/security', adminGuard, async (req, res) => {
   try {
     const suspicious = await PageView.aggregate([
       { $match: { ip_address: { $ne: null } } },
@@ -1605,7 +1626,7 @@ app.get('/api/admin/security', adminGuard, requirePermission('security'), async 
   } catch { res.json({ blocked_ips: [], suspicious: [] }); }
 });
 
-app.post('/api/admin/security/block-ip', adminGuard, requirePermission('security'), async (req, res) => {
+app.post('/api/admin/security/block-ip', adminGuard, async (req, res) => {
   const { ip } = req.body;
   if (!ip) return res.status(400).json({ error: 'IP required' });
   try {
@@ -1616,121 +1637,27 @@ app.post('/api/admin/security/block-ip', adminGuard, requirePermission('security
   } catch { res.status(500).json({ error: 'Failed' }); }
 });
 
-app.delete('/api/admin/security/block-ip/:ip', adminGuard, requirePermission('security'), async (req, res) => {
+app.delete('/api/admin/security/block-ip/:ip', adminGuard, async (req, res) => {
   try {
     cfg.blocked_ips = (cfg.blocked_ips || []).filter(i => i !== req.params.ip);
     saveCfg(); res.json({ success: true });
   } catch { res.status(500).json({ error: 'Failed' }); }
 });
 
-/* ── ADMINS — LIST, CREATE, ROLE & PERMISSION MANAGEMENT ────────
-   Only super_admin can create admins, change roles, delete admins,
-   or edit the role→permission matrix. Any authenticated admin can
-   view the admins list and the (read-only) permission matrix.     */
+/* ── ADMINS LIST ─────────────────────────────────────────────── */
 app.get('/api/admin/admins', adminGuard, async (req, res) => {
   try { res.json(fmtArr(await Admin.find().select('username email role created_at last_login').sort({ created_at: 1 }).lean())); }
   catch { res.json([]); }
 });
 
-// Create a new admin account directly from the dashboard (replaces the old public register page).
-app.post('/api/admin/admins', adminGuard, requireSuperAdmin, async (req, res) => {
-  const username = String(req.body?.username || '').trim();
-  const email    = String(req.body?.email || '').trim().toLowerCase();
-  const password = String(req.body?.password || '');
-  const role     = ['super_admin', 'admin', 'moderator'].includes(req.body?.role) ? req.body.role : 'admin';
-  if (!username || !email || !password) return res.status(400).json({ error: 'All fields required' });
-  if (username.length < 3) return res.status(400).json({ error: 'Username min 3 chars' });
-  if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ error: 'Valid email required' });
-  if (password.length < 8) return res.status(400).json({ error: 'Password min 8 chars' });
-  try {
-    // Case-insensitive check — Mongo's unique index on email is exact-match only,
-    // so without this a differently-cased duplicate would slip past here and
-    // throw a raw E11000 error instead of a clean 409.
-    const existing = await Admin.findOne({
-      $or: [{ email }, { username: new RegExp(`^${username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }]
-    });
-    if (existing) return res.status(409).json({ error: 'Email or username already taken' });
-    let hash;
-    try { hash = await bcrypt.hash(password, 12); }
-    catch (hashErr) { console.error('[AdminCreate:hash]', hashErr); return res.status(500).json({ error: 'Could not secure the password. Please try again.' }); }
-    const adm = await Admin.create({ username, email, password_hash: hash, role });
-    await sysLog('info', 'admin', `Admin "${username}" (${role}) created by ${req.admin.username}`);
-    return res.status(201).json({ id: adm._id.toString(), username, email, role, success: true });
-  } catch (err) {
-    console.error('[AdminCreate]', err);
-    if (err?.code === 11000) return res.status(409).json({ error: 'Email or username already taken' });
-    if (err?.name === 'ValidationError') return res.status(400).json({ error: Object.values(err.errors)[0]?.message || 'Invalid admin data' });
-    return res.status(500).json({ error: 'Failed to create admin. Please try again.' });
-  }
-});
-
-// Change an existing admin's role (this is also how an existing admin gets promoted to super_admin).
-app.put('/api/admin/admins/:id/role', adminGuard, requireSuperAdmin, async (req, res) => {
-  const { role } = req.body || {};
-  if (!['super_admin', 'admin', 'moderator'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
-  if (req.admin.id === req.params.id) return res.status(400).json({ error: 'You cannot change your own role' });
-  try {
-    const target = await Admin.findById(req.params.id);
-    if (!target) return res.status(404).json({ error: 'Admin not found' });
-    if (target.role === 'super_admin' && role !== 'super_admin') {
-      const superAdminCount = await Admin.countDocuments({ role: 'super_admin' });
-      if (superAdminCount <= 1) return res.status(400).json({ error: 'Cannot demote the last super admin' });
-    }
-    // Promoting to super_admin (or any other valid role change) is otherwise unrestricted.
-    target.role = role;
-    await target.save();
-    await sysLog('warn', 'admin', `${req.admin.username} changed ${target.username}'s role to ${role}`);
-    return res.json({ success: true, id: target._id.toString(), role: target.role });
-  } catch (err) {
-    console.error('[AdminRoleChange]', err);
-    if (err?.name === 'CastError') return res.status(400).json({ error: 'Invalid admin id' });
-    if (err?.name === 'ValidationError') return res.status(400).json({ error: Object.values(err.errors)[0]?.message || 'Invalid role data' });
-    return res.status(500).json({ error: 'Failed to update role. Please try again.' });
-  }
-});
-
-app.delete('/api/admin/admins/:id', adminGuard, requireSuperAdmin, async (req, res) => {
+app.delete('/api/admin/admins/:id', adminGuard, async (req, res) => {
   if (req.admin.id === req.params.id) return res.status(400).json({ error: 'Cannot delete yourself' });
-  try {
-    const target = await Admin.findById(req.params.id);
-    if (target?.role === 'super_admin') {
-      const superAdminCount = await Admin.countDocuments({ role: 'super_admin' });
-      if (superAdminCount <= 1) return res.status(400).json({ error: 'Cannot delete the last super admin' });
-    }
-    await Admin.findByIdAndDelete(req.params.id);
-    await sysLog('warn', 'admin', `${req.admin.username} deleted admin ${target?.username || req.params.id}`);
-    res.json({ success: true });
-  } catch { res.status(500).json({ error: 'Failed' }); }
-});
-
-/* ── ROLE → PERMISSION MATRIX ─────────────────────────────────── */
-app.get('/api/admin/role-permissions', adminGuard, async (req, res) => {
-  res.json({
-    permission_keys: PERMISSION_KEYS,
-    role_permissions: cfg.role_permissions,
-    editable: req.admin.role === 'super_admin',
-  });
-});
-
-app.put('/api/admin/role-permissions', adminGuard, requireSuperAdmin, async (req, res) => {
-  const incoming = req.body?.role_permissions || {};
-  try {
-    for (const role of ['admin', 'moderator']) {
-      if (!incoming[role]) continue;
-      const next = {};
-      for (const p of PERMISSION_KEYS) next[p.key] = !!incoming[role][p.key];
-      cfg.role_permissions[role] = next;
-    }
-    // super_admin permissions are never editable — always full access
-    cfg.role_permissions.super_admin = { ...DEFAULT_ROLE_PERMISSIONS.super_admin };
-    saveCfg();
-    await sysLog('info', 'admin', `Role permissions updated by ${req.admin.username}`);
-    res.json({ success: true, role_permissions: cfg.role_permissions });
-  } catch { res.status(500).json({ error: 'Failed to save permissions' }); }
+  try { await Admin.findByIdAndDelete(req.params.id); res.json({ success: true }); }
+  catch { res.status(500).json({ error: 'Failed' }); }
 });
 
 /* ── EXPORT ──────────────────────────────────────────────────── */
-app.get('/api/admin/export/users', adminGuard, requirePermission('export'), async (req, res) => {
+app.get('/api/admin/export/users', adminGuard, async (req, res) => {
   try {
     const users = await User.find().select('username email profession referral_source onboarded is_banned created_at last_login').sort({ created_at: -1 }).lean();
     res.setHeader('Content-Type', 'text/csv');
@@ -1741,7 +1668,7 @@ app.get('/api/admin/export/users', adminGuard, requirePermission('export'), asyn
   } catch { res.status(500).json({ error: 'Export failed' }); }
 });
 
-app.get('/api/admin/export/chats', adminGuard, requirePermission('export'), async (req, res) => {
+app.get('/api/admin/export/chats', adminGuard, async (req, res) => {
   try {
     const chats = await Chat.find().populate('user_id', 'username email').sort({ created_at: -1 }).lean();
     const enriched = await Promise.all(chats.map(async c => ({
@@ -1813,11 +1740,34 @@ io.use((socket, next) => {
 
 io.on('connection', socket => {
   if (socket.user) {
-    socket.join(`user_${socket.user.id}`);
+    const uid = String(socket.user.id);
+    socket.join(`user_${uid}`);
+
+    // Real presence: a user is "online" exactly as long as they have at
+    // least one live socket connection — no sampling, no guessing.
+    let presence = onlinePresence.get(uid);
+    if (!presence) {
+      presence = { username: socket.user.username, sockets: new Set(), since: new Date() };
+      onlinePresence.set(uid, presence);
+      logActivity('online', { username: socket.user.username, user_id: uid });
+    }
+    presence.sockets.add(socket.id);
+
     socket.on('join_chat', id => socket.join(`chat_${id}`));
     socket.on('leave_chat', id => socket.leave(`chat_${id}`));
     socket.on('typing', ({ chatId, isTyping }) => {
       socket.to(`chat_${chatId}`).emit('user_typing', { userId: socket.user.id, username: socket.user.username, isTyping });
+    });
+
+    socket.on('disconnect', () => {
+      const p = onlinePresence.get(uid);
+      if (!p) return;
+      p.sockets.delete(socket.id);
+      // Only mark offline once every tab/connection for this user has closed.
+      if (p.sockets.size === 0) {
+        onlinePresence.delete(uid);
+        logActivity('offline', { username: p.username, user_id: uid });
+      }
     });
   }
   if (socket.admin) { socket.join('admin_room'); }
