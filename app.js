@@ -224,29 +224,6 @@ async function sysLog(level, source, message, data, userId) {
   try { await SystemLog.create({ level, source, message, data: data || null, user_id: userId || null }); } catch {}
 }
 
-/* ══════════════════════════════════════════════════════════════
-   LIVE ACTIVITY (real, event-sourced — no randomized/fabricated
-   entries). Every call below is made at the exact moment a real
-   thing happens (a real login, a real message, a real ban…) and is
-   both persisted (so a fresh page load has real history) and pushed
-   instantly over Socket.IO to any admin dashboard in `admin_room`.
-   Online/offline state is derived from real Socket.IO connections —
-   see `onlinePresence` and the io.on('connection', …) handler below —
-   so a user only ever shows as active while a socket is actually open.
-══════════════════════════════════════════════════════════════ */
-const onlinePresence = new Map(); // userId(string) -> { username, sockets:Set<string>, since:Date }
-
-async function logActivity(action, { username = null, user_id = null, meta = null } = {}) {
-  const entry = { action, username, meta, created_at: new Date() };
-  try {
-    const doc = await SystemLog.create({ level: 'info', source: 'activity', message: action, data: { username, meta }, user_id: user_id || null });
-    entry.id = doc._id.toString();
-  } catch { entry.id = `tmp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`; }
-  const io = app.get('io');
-  if (io) io.to('admin_room').emit('admin_activity', entry);
-  return entry;
-}
-
 async function trackUsage(userId, chatId, tokens, type, responseMs, success) {
   try {
     await UsageTracking.create({ user_id: userId, chat_id: chatId, tokens_used: tokens, request_type: type, response_ms: responseMs, success });
@@ -365,7 +342,6 @@ app.post('/api/auth/register', async (req, res) => {
     const user = await User.create({ username, email: email.toLowerCase(), password_hash: hash });
     const token = jwt.sign({ id: user._id.toString(), username, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
     await sysLog('info', 'auth', `Registered: ${username}`, null, user._id);
-    logActivity('register', { username, user_id: user._id.toString() });
     res.status(201).json({ token, user: { id: user._id.toString(), username, email: user.email, onboarded: false } });
   } catch (err) { console.error('[Register]', err); res.status(500).json({ error: 'Registration failed. Please try again.' }); }
 });
@@ -383,7 +359,6 @@ app.post('/api/auth/login', async (req, res) => {
     user.last_login = new Date();
     await user.save();
     const token = jwt.sign({ id: user._id.toString(), username: user.username, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
-    logActivity('login', { username: user.username, user_id: user._id.toString() });
     res.json({ token, user: { id: user._id.toString(), username: user.username, email: user.email, avatar_url: user.avatar_url, onboarded: user.onboarded, profession: user.profession } });
   } catch (err) { console.error('[Login]', err); res.status(500).json({ error: 'Login failed. Please try again.' }); }
 });
@@ -403,13 +378,11 @@ app.post('/api/auth/google', async (req, res) => {
       if (existingUser) username = `${username}_${uid.slice(0, 5)}`;
       user = await User.create({ username, email: email.toLowerCase(), password_hash: hash, avatar_url: picture || null });
       await sysLog('info', 'auth', `Registered via Google: ${username}`, null, user._id);
-      logActivity('register', { username, user_id: user._id.toString() });
     } else {
       if (user.is_banned) return res.status(403).json({ error: 'Account suspended.' });
       user.last_login = new Date();
       if (picture) user.avatar_url = picture;
       await user.save();
-      logActivity('login', { username: user.username, user_id: user._id.toString() });
     }
     const token = jwt.sign({ id: user._id.toString(), username: user.username, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ token, user: { id: user._id.toString(), username: user.username, email: user.email, avatar_url: user.avatar_url, onboarded: user.onboarded, profession: user.profession } });
@@ -443,7 +416,6 @@ app.post('/api/auth/onboarding', authGuard, async (req, res) => {
     await User.findByIdAndUpdate(req.user.id, update);
     if (username) await setUserMemory(req.user.id, 'name', username);
     if (profession) await setUserMemory(req.user.id, 'profession', profession);
-    logActivity('onboarded', { username: username || req.user.username, user_id: req.user.id });
     res.json({ success: true });
   } catch (err) {
     console.error('[Onboarding]', err);
@@ -558,7 +530,6 @@ app.get('/api/chats', authGuard, async (req, res) => {
 app.post('/api/chats', authGuard, async (req, res) => {
   try {
     const chat = await Chat.create({ user_id: req.user.id, title: (req.body.title || 'New Chat').slice(0, 255) });
-    logActivity('new_chat', { username: req.user.username, user_id: req.user.id, meta: { chatId: chat._id.toString() } });
     res.status(201).json(fmt(chat));
   } catch { res.status(500).json({ error: 'Could not create chat' }); }
 });
@@ -854,7 +825,6 @@ app.post('/api/chats/:id/messages/stream', authGuard, uploadChat.single('file'),
       attachments: meta ? [meta] : [],
     });
     send('user_message', fmtMessage(userMsg));
-    logActivity('message', { username: req.user.username, user_id: req.user.id, meta: { chatId } });
 
     // Auto-title
     const msgCount = await Message.countDocuments({ chat_id: chatId });
@@ -999,7 +969,6 @@ app.post('/api/chats/:id/messages', authGuard, uploadChat.single('file'), async 
       message_type: prepared.messageType,
       attachments: meta ? [meta] : [],
     });
-    logActivity('message', { username: req.user.username, user_id: req.user.id, meta: { chatId } });
 
     const msgCount = await Message.countDocuments({ chat_id: chatId });
     if (msgCount <= 1 && content) { chat.title = content.slice(0, 60); await chat.save(); }
@@ -1156,7 +1125,6 @@ app.post('/api/admin/login', async (req, res) => {
     await adm.save();
     const token = jwt.sign({ id: adm._id.toString(), username: adm.username, email: adm.email, role: adm.role, isAdmin: true }, ADMIN_SECRET, { expiresIn: '8h' });
     await sysLog('info', 'admin', `Admin login: ${adm.username}`);
-    logActivity('admin_login', { username: adm.username, meta: { role: adm.role } });
     res.json({ token, admin: { id: adm._id.toString(), username: adm.username, email: adm.email, role: adm.role } });
   } catch (err) { console.error('[AdminLogin]', err); res.status(500).json({ error: 'Login failed.' }); }
 });
@@ -1242,26 +1210,6 @@ app.get('/api/admin/dashboard', adminGuard, async (req, res) => {
   } catch (err) { console.error('[AdminDash]', err); res.status(500).json({ error: 'Could not load dashboard' }); }
 });
 
-/* ── LIVE ACTIVITY (real events + real online presence) ──────────
-   Backs the "Live Activity" widget on the dashboard. `events` are
-   genuine actions pulled from the activity log (see logActivity());
-   `online_users` reflects who currently has a real, live Socket.IO
-   connection open — never a random sample. New events after the
-   initial load arrive over the 'admin_activity' socket event instead
-   of polling, so the feed stays accurate without guessing. ────────── */
-app.get('/api/admin/activity', adminGuard, async (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
-    const logs = await SystemLog.find({ source: 'activity' }).sort({ created_at: -1 }).limit(limit).lean();
-    const online_users = Array.from(onlinePresence.entries()).map(([user_id, p]) => ({ user_id, username: p.username, since: p.since }));
-    res.json({
-      events: logs.map(l => ({ id: l._id.toString(), action: l.message, username: l.data?.username || null, meta: l.data?.meta || null, created_at: l.created_at })),
-      online_count: onlinePresence.size,
-      online_users,
-    });
-  } catch (err) { console.error('[AdminActivity]', err); res.json({ events: [], online_count: 0, online_users: [] }); }
-});
-
 app.get('/api/admin/analytics', adminGuard, async (req, res) => {
   try {
     const twelveMonthsAgo = new Date(); twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
@@ -1342,9 +1290,8 @@ app.get('/api/admin/users/:id/stats', adminGuard, async (req, res) => {
 app.put('/api/admin/users/:id/ban', adminGuard, async (req, res) => {
   const { banned } = req.body;
   try {
-    const u = await User.findByIdAndUpdate(req.params.id, { is_banned: !!banned });
+    await User.findByIdAndUpdate(req.params.id, { is_banned: !!banned });
     await sysLog('warn', 'admin', `${banned ? 'Banned' : 'Unbanned'} user ${req.params.id}`);
-    logActivity(banned ? 'banned' : 'unbanned', { username: u?.username || null, user_id: req.params.id });
     res.json({ success: true });
   } catch { res.status(500).json({ error: 'Could not update user' }); }
 });
@@ -1441,7 +1388,6 @@ app.post('/api/admin/notifications', adminGuard, async (req, res) => {
     const notif = await Notification.create({ title, message, type, is_active: true, created_by: req.admin.id, expires_at: expires_at || null });
     const io = req.app.get('io'); if (io) io.emit('admin_notification', fmt(notif));
     await sysLog('info', 'admin', `Notification: ${title}`);
-    logActivity('broadcast', { username: req.admin.username, meta: { title } });
     res.json(fmt(notif));
   } catch { res.status(500).json({ error: 'Failed' }); }
 });
@@ -1740,34 +1686,11 @@ io.use((socket, next) => {
 
 io.on('connection', socket => {
   if (socket.user) {
-    const uid = String(socket.user.id);
-    socket.join(`user_${uid}`);
-
-    // Real presence: a user is "online" exactly as long as they have at
-    // least one live socket connection — no sampling, no guessing.
-    let presence = onlinePresence.get(uid);
-    if (!presence) {
-      presence = { username: socket.user.username, sockets: new Set(), since: new Date() };
-      onlinePresence.set(uid, presence);
-      logActivity('online', { username: socket.user.username, user_id: uid });
-    }
-    presence.sockets.add(socket.id);
-
+    socket.join(`user_${socket.user.id}`);
     socket.on('join_chat', id => socket.join(`chat_${id}`));
     socket.on('leave_chat', id => socket.leave(`chat_${id}`));
     socket.on('typing', ({ chatId, isTyping }) => {
       socket.to(`chat_${chatId}`).emit('user_typing', { userId: socket.user.id, username: socket.user.username, isTyping });
-    });
-
-    socket.on('disconnect', () => {
-      const p = onlinePresence.get(uid);
-      if (!p) return;
-      p.sockets.delete(socket.id);
-      // Only mark offline once every tab/connection for this user has closed.
-      if (p.sockets.size === 0) {
-        onlinePresence.delete(uid);
-        logActivity('offline', { username: p.username, user_id: uid });
-      }
     });
   }
   if (socket.admin) { socket.join('admin_room'); }
