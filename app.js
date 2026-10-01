@@ -490,7 +490,7 @@ app.post('/api/auth/google', async (req, res) => {
       logActivity('login', { username: user.username, user_id: user._id.toString() });
     }
     const token = jwt.sign({ id: user._id.toString(), username: user.username, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ token, user: { id: user._id.toString(), username: user.username, email: user.email, avatar_url: user.avatar_url, onboarded: user.onboarded, profession: user.profession } });
+    res.json({ token, user: { id: user._id.toString(), username: user.username, email: user.email, avatar_url: user.avatar_url, onboarded: user.onboarded, profession: user.profession, email_verified: user.email_verified } });
   } catch (err) {
     console.error('[Google Auth]', err);
     res.status(401).json({ error: 'Google authentication failed. Please try again.' });
@@ -516,6 +516,9 @@ app.put('/api/auth/profile', authGuard, async (req, res) => {
 app.post('/api/auth/onboarding', authGuard, async (req, res) => {
   const { username, referral_source, profession, usage_type, workspace_name, use_cases } = req.body;
   try {
+    const user = await User.findById(req.user.id).select('email_verified');
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (!user.email_verified) return res.status(403).json({ error: 'Verify your email before completing onboarding.' });
     const update = { onboarded: true, referral_source: referral_source || null, profession: profession || null };
     if (username) update.username = username;
     if (usage_type) update.usage_type = usage_type;
