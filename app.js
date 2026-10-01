@@ -168,6 +168,42 @@ async function sendOtpEmail(to, username, otp) {
     return true;
   } catch (e) { console.error('[Email]', e.message); return false; }
 }
+async function sendVerifyEmail(to, username, otp) {
+  try {
+    await mailer.sendMail({
+      from: process.env.SMTP_FROM || 'KinyaBot AI <noreply@kinyabot.ai>', to,
+      subject: 'Verify your KinyaBot account',
+      html: `<div style="font-family:Arial;max-width:520px;margin:40px auto;background:#111;border-radius:16px;overflow:hidden">
+        <div style="background:linear-gradient(135deg,#4f46e5,#7c3aed);padding:28px;text-align:center">
+          <h1 style="color:#fff;margin:0">KinyaBot AI</h1></div>
+        <div style="padding:28px">
+          <p style="color:#e3e3e3">Hi <strong>${username}</strong>, welcome! Confirm it's you with this code:</p>
+          <div style="text-align:center;margin:24px 0">
+            <div style="display:inline-block;background:rgba(109,40,217,.2);border:2px solid rgba(109,40,217,.5);border-radius:12px;padding:14px 36px">
+              <span style="font-size:34px;font-weight:700;color:#c4b5fd;letter-spacing:8px">${otp}</span></div></div>
+          <p style="color:#9aa0a6;font-size:13px;text-align:center">Expires in 15 minutes</p></div></div>`
+    });
+    return true;
+  } catch (e) { console.error('[Email]', e.message); return false; }
+}
+async function sendInviteEmail(to, inviterName, workspaceName) {
+  const link = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/register?invited_by=${encodeURIComponent(inviterName)}`;
+  try {
+    await mailer.sendMail({
+      from: process.env.SMTP_FROM || 'KinyaBot AI <noreply@kinyabot.ai>', to,
+      subject: `${inviterName} invited you to KinyaBot AI`,
+      html: `<div style="font-family:Arial;max-width:520px;margin:40px auto;background:#111;border-radius:16px;overflow:hidden">
+        <div style="background:linear-gradient(135deg,#4f46e5,#7c3aed);padding:28px;text-align:center">
+          <h1 style="color:#fff;margin:0">KinyaBot AI</h1></div>
+        <div style="padding:28px">
+          <p style="color:#e3e3e3"><strong>${inviterName}</strong> invited you to join${workspaceName ? ` the <strong>${workspaceName}</strong> workspace on` : ''} KinyaBot AI.</p>
+          <div style="text-align:center;margin:26px 0">
+            <a href="${link}" style="display:inline-block;background:#6d28d9;color:#fff;text-decoration:none;font-weight:700;padding:14px 32px;border-radius:99px">Accept invite</a></div>
+          <p style="color:#9aa0a6;font-size:13px;text-align:center">${link}</p></div></div>`
+    });
+    return true;
+  } catch (e) { console.error('[Email]', e.message); return false; }
+}
 
 /* ── MIDDLEWARES ─────────────────────────────────────────────── */
 function authGuard(req, res, next) {
@@ -366,8 +402,50 @@ app.post('/api/auth/register', async (req, res) => {
     const token = jwt.sign({ id: user._id.toString(), username, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
     await sysLog('info', 'auth', `Registered: ${username}`, null, user._id);
     logActivity('register', { username, user_id: user._id.toString() });
-    res.status(201).json({ token, user: { id: user._id.toString(), username, email: user.email, onboarded: false } });
+    res.status(201).json({ token, user: { id: user._id.toString(), username, email: user.email, onboarded: false, email_verified: false } });
   } catch (err) { console.error('[Register]', err); res.status(500).json({ error: 'Registration failed. Please try again.' }); }
+});
+
+/* Post-signup email verification — separate OTP from the password-reset one */
+app.post('/api/auth/send-verification', authGuard, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (user.email_verified) return res.json({ message: 'Already verified.' });
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    user.email_otp_code = otp;
+    user.email_otp_expires = new Date(Date.now() + 15 * 60 * 1000);
+    await user.save();
+    const sent = await sendVerifyEmail(user.email, user.username, otp);
+    if (sent) res.json({ message: 'Verification code sent to your email.' });
+    else res.json({ message: 'Email service not configured. Use code below for testing.', demo_otp: otp });
+  } catch (err) { console.error('[SendVerify]', err); res.status(500).json({ error: 'Failed to send code.' }); }
+});
+
+app.post('/api/auth/verify-email', authGuard, async (req, res) => {
+  const { otp } = req.body;
+  if (!otp) return res.status(400).json({ error: 'Code required' });
+  try {
+    const user = await User.findOne({ _id: req.user.id, email_otp_code: String(otp).trim(), email_otp_expires: { $gt: new Date() } });
+    if (!user) return res.status(400).json({ error: 'Invalid or expired code.' });
+    user.email_verified = true;
+    user.email_otp_code = null;
+    user.email_otp_expires = null;
+    await user.save();
+    res.json({ success: true });
+  } catch (err) { console.error('[VerifyEmail]', err); res.status(500).json({ error: 'Verification failed.' }); }
+});
+
+/* Invite a teammate by email — used on the onboarding "invite" step */
+app.post('/api/onboarding/invite', authGuard, async (req, res) => {
+  const { email } = req.body;
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Valid email required' });
+  try {
+    const user = await User.findById(req.user.id);
+    const sent = await sendInviteEmail(email.toLowerCase(), user?.username || 'A teammate', user?.workspace_name || null);
+    if (sent) res.json({ success: true, message: `Invitation sent to ${email}` });
+    else res.json({ success: false, message: 'Email service not configured — invitation was not delivered.' });
+  } catch (err) { console.error('[Invite]', err); res.status(500).json({ error: 'Could not send invitation.' }); }
 });
 
 app.post('/api/auth/login', async (req, res) => {
@@ -384,7 +462,7 @@ app.post('/api/auth/login', async (req, res) => {
     await user.save();
     const token = jwt.sign({ id: user._id.toString(), username: user.username, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
     logActivity('login', { username: user.username, user_id: user._id.toString() });
-    res.json({ token, user: { id: user._id.toString(), username: user.username, email: user.email, avatar_url: user.avatar_url, onboarded: user.onboarded, profession: user.profession } });
+    res.json({ token, user: { id: user._id.toString(), username: user.username, email: user.email, avatar_url: user.avatar_url, onboarded: user.onboarded, profession: user.profession, email_verified: user.email_verified } });
   } catch (err) { console.error('[Login]', err); res.status(500).json({ error: 'Login failed. Please try again.' }); }
 });
 
@@ -421,7 +499,7 @@ app.post('/api/auth/google', async (req, res) => {
 
 app.get('/api/auth/me', authGuard, async (req, res) => {
   try {
-    const user = await User.findById(req.user.id).select('username email avatar_url profession onboarded created_at last_login').lean();
+    const user = await User.findById(req.user.id).select('username email avatar_url profession onboarded email_verified usage_type workspace_name use_cases created_at last_login').lean();
     if (!user) return res.status(404).json({ error: 'User not found' });
     res.json({ ...user, id: user._id.toString(), _id: undefined });
   } catch { res.status(500).json({ error: 'Could not fetch profile' }); }
@@ -436,10 +514,13 @@ app.put('/api/auth/profile', authGuard, async (req, res) => {
 });
 
 app.post('/api/auth/onboarding', authGuard, async (req, res) => {
-  const { username, referral_source, profession } = req.body;
+  const { username, referral_source, profession, usage_type, workspace_name, use_cases } = req.body;
   try {
     const update = { onboarded: true, referral_source: referral_source || null, profession: profession || null };
     if (username) update.username = username;
+    if (usage_type) update.usage_type = usage_type;
+    if (workspace_name) update.workspace_name = workspace_name;
+    if (Array.isArray(use_cases)) update.use_cases = use_cases;
     await User.findByIdAndUpdate(req.user.id, update);
     if (username) await setUserMemory(req.user.id, 'name', username);
     if (profession) await setUserMemory(req.user.id, 'profession', profession);
