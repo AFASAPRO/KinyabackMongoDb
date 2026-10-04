@@ -718,6 +718,25 @@ app.get('/api/files/:name', async (req, res) => {
   res.sendFile(path.resolve(filePath));
 });
 
+/* ── Per-chat reply preferences (language / style) ───────────────
+   Whitelisted values only — the client never sends free text into the
+   system prompt. Returns '' when no valid preference was supplied. */
+const REPLY_LANGS = { en:'English', fr:'French', rw:'Kinyarwanda', sw:'Swahili', es:'Spanish', de:'German', ar:'Arabic', zh:'Chinese' };
+const REPLY_STYLES = {
+  concise:  'Keep answers short and to the point.',
+  balanced: '',
+  detailed: 'Give thorough, step-by-step answers with examples where useful.',
+  code:     'Prioritise working code first, then a brief explanation.',
+};
+function replyPrefsPrompt(body = {}, headers = {}) {
+  const parts = [];
+  const lang = REPLY_LANGS[String(body.reply_language || headers['x-reply-language'] || '')];
+  const style = REPLY_STYLES[String(body.reply_style || headers['x-reply-style'] || '')];
+  if (lang) parts.push(`Always reply in ${lang} unless the user explicitly asks for another language.`);
+  if (style) parts.push(style);
+  return parts.join(' ');
+}
+
 /* ── Shared assistant turn (real Groq streaming, SSE) ────────── */
 async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = 'chat' }) {
   const abortController = new AbortController();
@@ -778,8 +797,9 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
     else if (att) userText = 'Please tell me about the file I attached.';
   }
 
+  const prefs = replyPrefsPrompt(req.body, req.headers);
   const messages = chatService.buildMessages({
-    systemPrompt: cfg.system_prompt, memory, ragContext,
+    systemPrompt: [cfg.system_prompt, prefs].filter(Boolean).join('\n\n'), memory, ragContext,
     history: kept, summary, documentContext,
     userText,
     imageDataUrl,
