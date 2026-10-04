@@ -398,11 +398,11 @@ app.post('/api/auth/register', async (req, res) => {
     const existing = await User.findOne({ $or: [{ email: email.toLowerCase() }, { username }] });
     if (existing) return res.status(409).json({ error: 'Email or username already in use' });
     const hash = await bcrypt.hash(password, 12);
-    const user = await User.create({ username, email: email.toLowerCase(), password_hash: hash });
+    const user = await User.create({ username, email: email.toLowerCase(), password_hash: hash, email_verified: true });
     const token = jwt.sign({ id: user._id.toString(), username, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
     await sysLog('info', 'auth', `Registered: ${username}`, null, user._id);
     logActivity('register', { username, user_id: user._id.toString() });
-    res.status(201).json({ token, user: { id: user._id.toString(), username, email: user.email, onboarded: false, email_verified: false } });
+    res.status(201).json({ token, user: { id: user._id.toString(), username, email: user.email, onboarded: false, email_verified: true } });
   } catch (err) { console.error('[Register]', err); res.status(500).json({ error: 'Registration failed. Please try again.' }); }
 });
 
@@ -471,7 +471,7 @@ app.post('/api/auth/google', async (req, res) => {
   if (!idToken) return res.status(400).json({ error: 'ID Token required' });
   try {
     const decodedToken = await admin.auth().verifyIdToken(idToken);
-    const { email, name, picture, uid } = decodedToken;
+    const { email, name, picture, uid, email_verified } = decodedToken;
     let user = await User.findOne({ email: email.toLowerCase() });
     if (!user) {
       const randomPass = crypto.randomBytes(16).toString('hex');
@@ -479,13 +479,14 @@ app.post('/api/auth/google', async (req, res) => {
       let username = name || email.split('@')[0];
       const existingUser = await User.findOne({ username });
       if (existingUser) username = `${username}_${uid.slice(0, 5)}`;
-      user = await User.create({ username, email: email.toLowerCase(), password_hash: hash, avatar_url: picture || null });
+      user = await User.create({ username, email: email.toLowerCase(), password_hash: hash, avatar_url: picture || null, email_verified: email_verified === true });
       await sysLog('info', 'auth', `Registered via Google: ${username}`, null, user._id);
       logActivity('register', { username, user_id: user._id.toString() });
     } else {
       if (user.is_banned) return res.status(403).json({ error: 'Account suspended.' });
       user.last_login = new Date();
       if (picture) user.avatar_url = picture;
+      if (email_verified === true) user.email_verified = true;
       await user.save();
       logActivity('login', { username: user.username, user_id: user._id.toString() });
     }
@@ -516,9 +517,8 @@ app.put('/api/auth/profile', authGuard, async (req, res) => {
 app.post('/api/auth/onboarding', authGuard, async (req, res) => {
   const { username, referral_source, profession, usage_type, workspace_name, use_cases } = req.body;
   try {
-    const user = await User.findById(req.user.id).select('email_verified');
+    const user = await User.findById(req.user.id).select('_id');
     if (!user) return res.status(404).json({ error: 'User not found' });
-    if (!user.email_verified) return res.status(403).json({ error: 'Verify your email before completing onboarding.' });
     const update = { onboarded: true, referral_source: referral_source || null, profession: profession || null };
     if (username) update.username = username;
     if (usage_type) update.usage_type = usage_type;
