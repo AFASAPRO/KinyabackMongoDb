@@ -22,11 +22,15 @@ const chatService     = require('./services/ai/chatService');
 const documentService = require('./services/ai/documentService');
 const speechService   = require('./services/ai/speechService');
 const rateLimiter     = require('./services/rateLimiter');
+const settings        = require('./services/settings');
+const { attachIo, onlinePresence, logActivity } = require('./services/activity');
+const { notifyAdmins } = require('./services/notify');
+const pushService     = require('./services/push');
 
 const {
   User, Chat, Message, Admin, Notification, PageView,
   SystemLog, UserMemory, KnowledgeBase, UsageTracking,
-  UserPlan, FlaggedContent
+  UserPlan, FlaggedContent, SecurityEvent
 } = require('./models');
 
 // Firebase Admin init
@@ -129,19 +133,10 @@ const uploadAudio = multer({
   fileFilter(_, file, cb) { cb(null, /\.(mp3|wav|m4a|ogg|webm|flac|aac|mp4)$/i.test(file.originalname)); }
 });
 
-/* ── SETTINGS ────────────────────────────────────────────────── */
-const SETTINGS_FILE = './admin-settings.json';
-let cfg = {
-  max_tokens: 2048, temperature: 0.7, max_context_messages: 10,
-  system_prompt: 'You are KinyaBot, a helpful AI assistant. Be concise, friendly, and accurate.',
-  image_gen_enabled: true, file_uploads_enabled: true,
-  maintenance_mode: false, app_name: 'KinyaBot AI',
-  blocked_ips: [], cost_per_1k_tokens: 0.002,
-  free_daily_limit: 50, premium_daily_limit: 500,
-  moderation_enabled: true, knowledge_base_enabled: true
-};
-try { cfg = { ...cfg, ...JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')) }; } catch {}
-function saveCfg() { try { fs.writeFileSync(SETTINGS_FILE, JSON.stringify(cfg, null, 2)); } catch {} }
+/* ── SETTINGS ──────────────────────────────────────────────────
+   Owned by services/settings.js (single source of truth shared with
+   the Superadmin Settings / AI Control pages).                     */
+const cfg = settings.get();
 
 /* ── EMAIL ───────────────────────────────────────────────────── */
 const mailer = nodemailer.createTransport({
@@ -262,31 +257,33 @@ async function sysLog(level, source, message, data, userId) {
 
 /* ══════════════════════════════════════════════════════════════
    LIVE ACTIVITY (real, event-sourced — no randomized/fabricated
-   entries). Every call below is made at the exact moment a real
-   thing happens (a real login, a real message, a real ban…) and is
-   both persisted (so a fresh page load has real history) and pushed
-   instantly over Socket.IO to any admin dashboard in `admin_room`.
-   Online/offline state is derived from real Socket.IO connections —
-   see `onlinePresence` and the io.on('connection', …) handler below —
-   so a user only ever shows as active while a socket is actually open.
+   entries). Implemented in services/activity.js: logActivity(),
+   onlinePresence, attachIo(). Every call is made at the exact
+   moment a real thing happens and is both persisted and pushed
+   over Socket.IO to the Superadmin dashboards in `admin_room`.
+   Online/offline state derives from real Socket.IO connections —
+   see the io.on('connection', …) handler below.
 ══════════════════════════════════════════════════════════════ */
-const onlinePresence = new Map(); // userId(string) -> { username, sockets:Set<string>, since:Date }
 
-async function logActivity(action, { username = null, user_id = null, meta = null } = {}) {
-  const entry = { action, username, meta, created_at: new Date() };
-  try {
-    const doc = await SystemLog.create({ level: 'info', source: 'activity', message: action, data: { username, meta }, user_id: user_id || null });
-    entry.id = doc._id.toString();
-  } catch { entry.id = `tmp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`; }
-  const io = app.get('io');
-  if (io) io.to('admin_room').emit('admin_activity', entry);
-  return entry;
-}
-
+/* Real AI request telemetry for the Superadmin dashboards. */
 async function trackUsage(userId, chatId, tokens, type, responseMs, success) {
   try {
     await UsageTracking.create({ user_id: userId, chat_id: chatId, tokens_used: tokens, request_type: type, response_ms: responseMs, success });
   } catch {}
+  if (success) {
+    const io = app.get('io');
+    if (io) io.to('admin_room').emit('admin_ai_request', { ok: true, ms: responseMs, type });
+  } else {
+    logActivity('ai_request_failed', { meta: { type, ms: responseMs } });
+    const io = app.get('io');
+    if (io) io.to('admin_room').emit('admin_ai_request', { ok: false, ms: responseMs, type });
+    notifyAdmins({
+      title: 'AI request failed',
+      message: `A ${type || 'chat'} request failed after ${responseMs || 0}ms.`,
+      type: 'warning', category: 'ai', link: '/admin/ai',
+      dedupeKey: `ai-fail-${type}`, push: false,
+    }).catch(() => {});
+  }
 }
 
 async function getUserMemory(userId) {
@@ -347,6 +344,40 @@ async function moderateContent(text) {
   return { flagged: false, reason: null };
 }
 
+/* A real moderation flag was just created — surface it to the
+   Superadmin (notification center + security log + live feed). */
+async function onContentFlagged(chatId, userId, reason, auto) {
+  try {
+    await SecurityEvent.create({ type: 'moderation_flag', severity: 'warning', message: reason, meta: { chat_id: chatId ? String(chatId) : null, auto_flagged: !!auto } });
+  } catch {}
+  let username = null;
+  if (userId) { try { const u = await User.findById(userId).select('username').lean(); username = u?.username || null; } catch {} }
+  logActivity('content_flagged', { username, user_id: userId || null, meta: { reason } });
+  notifyAdmins({
+    title: 'Content flagged by moderation',
+    message: `${username || 'A user'}: ${reason}`,
+    type: 'warning', category: 'moderation', link: '/admin/moderation',
+    resource: { kind: 'chat', id: chatId ? String(chatId) : null },
+    dedupeKey: 'moderation-flag', push: false,
+  }).catch(() => {});
+}
+
+/* Real rate-limit / quota trip → security telemetry. */
+async function onRateLimited(userId, kind) {
+  try {
+    let username = null;
+    if (userId) { try { const u = await User.findById(userId).select('username').lean(); username = u?.username || null; } catch {} }
+    await SecurityEvent.create({ type: 'rate_limited', severity: 'info', username, message: `${kind} rate limit reached` });
+    notifyAdmins({
+      title: 'Rate limit reached',
+      message: `${username || 'A user'} hit the ${kind} rate limit.`,
+      type: 'info', category: 'security', link: '/admin/security',
+      dedupeKey: `rate-${kind}`, push: false,
+    }).catch(() => {});
+  } catch {}
+}
+
+/* Real rate-limit / quota trip → security telemetry. */
 function extractTextFromFile(filePath) {
   try {
     const ext = path.extname(filePath).toLowerCase();
@@ -453,11 +484,17 @@ app.post('/api/auth/login', async (req, res) => {
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
   try {
     const user = await User.findOne({ email: email.toLowerCase() });
-    if (!user) return res.status(401).json({ error: 'Invalid email or password' });
+    if (!user) {
+      SecurityEvent.create({ type: 'login_failed', severity: 'info', username: email, ip: req.ip, user_agent: req.headers['user-agent'], message: 'Unknown email' }).catch(() => {});
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
     if (user.is_banned) return res.status(403).json({ error: 'Account suspended. Please contact support.' });
     if (cfg.maintenance_mode) return res.status(503).json({ error: 'KinyaBot is in maintenance mode. Please check back soon.' });
     const ok = await bcrypt.compare(password, user.password_hash);
-    if (!ok) return res.status(401).json({ error: 'Invalid email or password' });
+    if (!ok) {
+      SecurityEvent.create({ type: 'login_failed', severity: 'info', username: user.username, ip: req.ip, user_agent: req.headers['user-agent'], message: 'Wrong password' }).catch(() => {});
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
     user.last_login = new Date();
     await user.save();
     const token = jwt.sign({ id: user._id.toString(), username: user.username, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
@@ -1244,583 +1281,33 @@ app.get('/api/usage', authGuard, async (req, res) => {
     res.json({ today, month, tokens, daily_limit, remaining: Math.max(0, daily_limit - today) });
   } catch { res.json({ today: 0, month: 0, tokens: 0, daily_limit: 50, remaining: 50 }); }
 });
-
 /* ══════════════════════════════════════════════════════════════
-   ADMIN AUTH
+   SUPERADMIN API (v2) — implemented in routes/admin.js
+   One administrative role: super_admin. Every endpoint verifies
+   authentication + authorization server-side, records audit events
+   for every mutation, and returns only real data.
 ══════════════════════════════════════════════════════════════ */
-app.post('/api/admin/login', async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-  try {
-    const adm = await Admin.findOne({ email: email.toLowerCase() });
-    if (!adm) return res.status(401).json({ error: 'Invalid credentials' });
-    const ok = await bcrypt.compare(password, adm.password_hash);
-    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-    adm.last_login = new Date();
-    await adm.save();
-    const token = jwt.sign({ id: adm._id.toString(), username: adm.username, email: adm.email, role: adm.role, isAdmin: true }, ADMIN_SECRET, { expiresIn: '8h' });
-    await sysLog('info', 'admin', `Admin login: ${adm.username}`);
-    logActivity('admin_login', { username: adm.username, meta: { role: adm.role } });
-    res.json({ token, admin: { id: adm._id.toString(), username: adm.username, email: adm.email, role: adm.role } });
-  } catch (err) { console.error('[AdminLogin]', err); res.status(500).json({ error: 'Login failed.' }); }
-});
-
-app.post('/api/admin/register', async (req, res) => {
-  const { username, email, password, invite_code, role = 'admin' } = req.body;
-  if (!username || !email || !password) return res.status(400).json({ error: 'All fields required' });
-  if (username.length < 3) return res.status(400).json({ error: 'Username min 3 chars' });
-  if (password.length < 8) return res.status(400).json({ error: 'Password min 8 chars' });
-  const INVITE_CODE = process.env.ADMIN_INVITE_CODE || 'KinyaBot-Admin-2024';
-  try {
-    const totalAdmins = await Admin.countDocuments();
-    if (totalAdmins > 0 && (invite_code || '').trim() !== INVITE_CODE)
-      return res.status(403).json({ error: `Invalid invite code. Use: ${INVITE_CODE}` });
-    const existing = await Admin.findOne({ $or: [{ email: email.toLowerCase() }, { username }] });
-    if (existing) return res.status(409).json({ error: 'Email or username already taken' });
-    const hash = await bcrypt.hash(password, 12);
-    const assignedRole = totalAdmins === 0 ? 'super_admin' : role;
-    const adm = await Admin.create({ username, email: email.toLowerCase(), password_hash: hash, role: assignedRole });
-    const token = jwt.sign({ id: adm._id.toString(), username, email: adm.email, role: assignedRole, isAdmin: true }, ADMIN_SECRET, { expiresIn: '8h' });
-    await sysLog('info', 'admin', `Admin registered: ${username}`);
-    res.status(201).json({ token, admin: { id: adm._id.toString(), username, email: adm.email, role: assignedRole } });
-  } catch (err) { console.error('[AdminReg]', err); res.status(500).json({ error: 'Registration failed: ' + err.message }); }
-});
-
-/* ══════════════════════════════════════════════════════════════
-   ADMIN — DASHBOARD & ANALYTICS
-══════════════════════════════════════════════════════════════ */
-app.get('/api/admin/dashboard', adminGuard, async (req, res) => {
-  try {
-    const now = new Date();
-    const todayStart = new Date(now); todayStart.setHours(0, 0, 0, 0);
-    const sevenDaysAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
-
-    const [total_users, total_chats, total_messages, active_today, new_today, msgs_today,
-           total_views, views_today, tokenAgg, flagged_count] = await Promise.all([
-      User.countDocuments(),
-      Chat.countDocuments(),
-      Message.countDocuments(),
-      User.countDocuments({ last_login: { $gte: todayStart } }),
-      User.countDocuments({ created_at: { $gte: todayStart } }),
-      Message.countDocuments({ created_at: { $gte: todayStart } }),
-      PageView.countDocuments(),
-      PageView.countDocuments({ created_at: { $gte: todayStart } }),
-      UsageTracking.aggregate([{ $group: { _id: null, total: { $sum: '$tokens_used' } } }]),
-      FlaggedContent.countDocuments({ reviewed: false }),
-    ]);
-
-    const total_tokens = tokenAgg[0]?.total || 0;
-    const total_cost = (total_tokens / 1000 * (cfg.cost_per_1k_tokens || 0.002)).toFixed(4);
-
-    const [daily_users, daily_messages, daily_views, professions, referrals] = await Promise.all([
-      User.aggregate([
-        { $match: { created_at: { $gte: sevenDaysAgo } } },
-        { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$created_at' } }, count: { $sum: 1 } } },
-        { $sort: { _id: 1 } }, { $project: { date: '$_id', count: 1, _id: 0 } }
-      ]),
-      Message.aggregate([
-        { $match: { created_at: { $gte: sevenDaysAgo } } },
-        { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$created_at' } }, count: { $sum: 1 } } },
-        { $sort: { _id: 1 } }, { $project: { date: '$_id', count: 1, _id: 0 } }
-      ]),
-      PageView.aggregate([
-        { $match: { created_at: { $gte: sevenDaysAgo } } },
-        { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$created_at' } }, count: { $sum: 1 } } },
-        { $sort: { _id: 1 } }, { $project: { date: '$_id', count: 1, _id: 0 } }
-      ]),
-      User.aggregate([
-        { $match: { profession: { $ne: null } } },
-        { $group: { _id: '$profession', count: { $sum: 1 } } },
-        { $sort: { count: -1 } }, { $limit: 8 },
-        { $project: { profession: '$_id', count: 1, _id: 0 } }
-      ]),
-      User.aggregate([
-        { $match: { referral_source: { $ne: null } } },
-        { $group: { _id: '$referral_source', count: { $sum: 1 } } },
-        { $sort: { count: -1 } }, { $limit: 8 },
-        { $project: { referral_source: '$_id', count: 1, _id: 0 } }
-      ]),
-    ]);
-
-    res.json({ total_users, total_chats, total_messages, active_today, new_today, msgs_today, total_views, views_today, total_tokens, total_cost, daily_users, daily_messages, daily_views, professions, referrals, flagged_count });
-  } catch (err) { console.error('[AdminDash]', err); res.status(500).json({ error: 'Could not load dashboard' }); }
-});
-
-/* ── LIVE ACTIVITY (real events + real online presence) ──────────
-   Backs the "Live Activity" widget on the dashboard. `events` are
-   genuine actions pulled from the activity log (see logActivity());
-   `online_users` reflects who currently has a real, live Socket.IO
-   connection open — never a random sample. New events after the
-   initial load arrive over the 'admin_activity' socket event instead
-   of polling, so the feed stays accurate without guessing. ────────── */
-app.get('/api/admin/activity', adminGuard, async (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
-    const logs = await SystemLog.find({ source: 'activity' }).sort({ created_at: -1 }).limit(limit).lean();
-    const online_users = Array.from(onlinePresence.entries()).map(([user_id, p]) => ({ user_id, username: p.username, since: p.since }));
-    res.json({
-      events: logs.map(l => ({ id: l._id.toString(), action: l.message, username: l.data?.username || null, meta: l.data?.meta || null, created_at: l.created_at })),
-      online_count: onlinePresence.size,
-      online_users,
+/* Record real unauthorized-access attempts against the Superadmin
+   API (login endpoint excluded — it has its own telemetry).
+   Registered BEFORE the router so the finish hook sees the final
+   401/403 status codes emitted by the router's guard.            */
+app.use('/api/admin', (req, res, next) => {
+  if (req.path !== '/login') {
+    res.on('finish', () => {
+      if (res.statusCode === 401 || res.statusCode === 403) {
+        SecurityEvent.create({
+          type: 'unauthorized_access', severity: 'warning',
+          ip: req.ip, user_agent: req.headers['user-agent'],
+          message: `${req.method} /api/admin${req.path} → ${res.statusCode}`,
+        }).catch(() => {});
+      }
     });
-  } catch (err) { console.error('[AdminActivity]', err); res.json({ events: [], online_count: 0, online_users: [] }); }
+  }
+  next();
 });
 
-app.get('/api/admin/analytics', adminGuard, async (req, res) => {
-  try {
-    const twelveMonthsAgo = new Date(); twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-
-    const [top_users, hourly_activity, monthly_users, monthly_messages, role_dist, token_usage, success_rate] = await Promise.all([
-      User.aggregate([
-        { $lookup: { from: 'chats', localField: '_id', foreignField: 'user_id', as: 'chats' } },
-        { $lookup: { from: 'messages', localField: 'chats._id', foreignField: 'chat_id', as: 'msgs' } },
-        { $project: { username: 1, email: 1, msg_count: { $size: '$msgs' } } },
-        { $sort: { msg_count: -1 } }, { $limit: 10 }
-      ]),
-      Message.aggregate([
-        { $match: { created_at: { $gte: sevenDaysAgo } } },
-        { $group: { _id: { $hour: '$created_at' }, count: { $sum: 1 } } },
-        { $sort: { _id: 1 } }, { $project: { hour: '$_id', count: 1, _id: 0 } }
-      ]),
-      User.aggregate([
-        { $match: { created_at: { $gte: twelveMonthsAgo } } },
-        { $group: { _id: { $dateToString: { format: '%Y-%m', date: '$created_at' } }, count: { $sum: 1 } } },
-        { $sort: { _id: 1 } }, { $project: { month: '$_id', count: 1, _id: 0 } }
-      ]),
-      Message.aggregate([
-        { $match: { created_at: { $gte: twelveMonthsAgo } } },
-        { $group: { _id: { $dateToString: { format: '%Y-%m', date: '$created_at' } }, count: { $sum: 1 } } },
-        { $sort: { _id: 1 } }, { $project: { month: '$_id', count: 1, _id: 0 } }
-      ]),
-      User.aggregate([
-        { $group: { _id: '$onboarded', count: { $sum: 1 } } },
-        { $project: { onboarded: '$_id', count: 1, _id: 0 } }
-      ]),
-      UsageTracking.aggregate([
-        { $match: { created_at: { $gte: thirtyDaysAgo } } },
-        { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$created_at' } }, tokens: { $sum: '$tokens_used' }, requests: { $sum: 1 }, avg_ms: { $avg: '$response_ms' } } },
-        { $sort: { _id: 1 } }, { $project: { date: '$_id', tokens: 1, requests: 1, avg_ms: 1, _id: 0 } }
-      ]),
-      UsageTracking.aggregate([
-        { $match: { created_at: { $gte: sevenDaysAgo } } },
-        { $group: { _id: null, ok: { $sum: { $cond: ['$success', 1, 0] } }, total: { $sum: 1 } } }
-      ]),
-    ]);
-
-    res.json({ top_users, hourly_activity, monthly_users, monthly_messages, role_dist, token_usage, success_rate: success_rate[0] || { ok: 0, total: 0 } });
-  } catch (err) { res.json({ top_users: [], hourly_activity: [], monthly_users: [], monthly_messages: [], role_dist: [], token_usage: [], success_rate: { ok: 0, total: 0 } }); }
-});
-
-/* ── USERS (admin) ───────────────────────────────────────────── */
-app.get('/api/admin/users', adminGuard, async (req, res) => {
-  const { page = 1, limit = 20, search = '' } = req.query;
-  const skip = (parseInt(page) - 1) * parseInt(limit);
-  try {
-    const filter = search ? { $or: [{ username: { $regex: search, $options: 'i' } }, { email: { $regex: search, $options: 'i' } }] } : {};
-    const [users, total] = await Promise.all([
-      User.find(filter).select('username email profession referral_source onboarded is_banned created_at last_login avatar_url').sort({ created_at: -1 }).skip(skip).limit(parseInt(limit)).lean(),
-      User.countDocuments(filter)
-    ]);
-    res.json({ users: users.map(u => ({ ...u, id: u._id.toString(), _id: undefined })), total, page: parseInt(page), pages: Math.ceil(total / parseInt(limit)) || 1 });
-  } catch { res.status(500).json({ error: 'Could not load users' }); }
-});
-
-app.get('/api/admin/users/:id/stats', adminGuard, async (req, res) => {
-  try {
-    const uid = new mongoose.Types.ObjectId(req.params.id);
-    const chats = await Chat.find({ user_id: uid }).select('_id').lean();
-    const chatIds = chats.map(c => c._id);
-    const [total_chats, total_messages, tokenAgg, lastView, memory] = await Promise.all([
-      Promise.resolve(chats.length),
-      Message.countDocuments({ chat_id: { $in: chatIds } }),
-      UsageTracking.aggregate([{ $match: { user_id: uid } }, { $group: { _id: null, total: { $sum: '$tokens_used' } } }]),
-      PageView.findOne({ user_id: uid }).sort({ created_at: -1 }).select('ip_address').lean(),
-      getUserMemory(req.params.id),
-    ]);
-    res.json({ total_chats, total_messages, total_tokens: tokenAgg[0]?.total || 0, last_ip: lastView?.ip_address || null, memory });
-  } catch { res.json({ total_chats: 0, total_messages: 0, total_tokens: 0, last_ip: null, memory: {} }); }
-});
-
-app.put('/api/admin/users/:id/ban', adminGuard, async (req, res) => {
-  const { banned } = req.body;
-  try {
-    const u = await User.findByIdAndUpdate(req.params.id, { is_banned: !!banned });
-    await sysLog('warn', 'admin', `${banned ? 'Banned' : 'Unbanned'} user ${req.params.id}`);
-    logActivity(banned ? 'banned' : 'unbanned', { username: u?.username || null, user_id: req.params.id });
-    res.json({ success: true });
-  } catch { res.status(500).json({ error: 'Could not update user' }); }
-});
-
-app.put('/api/admin/users/:id/plan', adminGuard, async (req, res) => {
-  const { plan, daily_limit, monthly_limit, tokens_limit } = req.body;
-  try {
-    await UserPlan.findOneAndUpdate(
-      { user_id: req.params.id },
-      { plan, daily_limit: daily_limit || 50, monthly_limit: monthly_limit || 500, tokens_limit: tokens_limit || 100000 },
-      { upsert: true, new: true }
-    );
-    res.json({ success: true });
-  } catch { res.status(500).json({ error: 'Could not update plan' }); }
-});
-
-app.put('/api/admin/users/:id/reset-password', adminGuard, async (req, res) => {
-  const { password } = req.body;
-  if (!password || password.length < 8) return res.status(400).json({ error: 'Password min 8 chars' });
-  try {
-    const hash = await bcrypt.hash(password, 12);
-    await User.findByIdAndUpdate(req.params.id, { password_hash: hash });
-    await sysLog('warn', 'admin', `Password reset for user ${req.params.id}`);
-    res.json({ success: true });
-  } catch { res.status(500).json({ error: 'Failed' }); }
-});
-
-app.delete('/api/admin/users/:id/memory', adminGuard, async (req, res) => {
-  try { await UserMemory.deleteMany({ user_id: req.params.id }); res.json({ success: true }); }
-  catch { res.status(500).json({ error: 'Failed' }); }
-});
-
-app.delete('/api/admin/users/:id', adminGuard, async (req, res) => {
-  try {
-    const chats = await Chat.find({ user_id: req.params.id }).select('_id').lean();
-    const chatIds = chats.map(c => c._id);
-    await Message.deleteMany({ chat_id: { $in: chatIds } });
-    await Chat.deleteMany({ user_id: req.params.id });
-    await UserMemory.deleteMany({ user_id: req.params.id });
-    await UsageTracking.deleteMany({ user_id: req.params.id });
-    await UserPlan.deleteOne({ user_id: req.params.id });
-    await User.findByIdAndDelete(req.params.id);
-    await sysLog('warn', 'admin', `Deleted user ${req.params.id}`);
-    res.json({ success: true });
-  } catch { res.status(500).json({ error: 'Could not delete user' }); }
-});
-
-/* ── CHATS (admin) ───────────────────────────────────────────── */
-app.get('/api/admin/chats', adminGuard, async (req, res) => {
-  const { page = 1, limit = 20, search = '' } = req.query;
-  const skip = (parseInt(page) - 1) * parseInt(limit);
-  try {
-    const matchStage = search ? { title: { $regex: search, $options: 'i' } } : {};
-    const [chats, total] = await Promise.all([
-      Chat.find(matchStage).populate('user_id', 'username email').sort({ updated_at: -1 }).skip(skip).limit(parseInt(limit)).lean(),
-      Chat.countDocuments()
-    ]);
-    const enriched = await Promise.all(chats.map(async c => {
-      const msg_count = await Message.countDocuments({ chat_id: c._id });
-      return { ...c, id: c._id.toString(), _id: undefined, username: c.user_id?.username, email: c.user_id?.email, user_id: c.user_id?._id?.toString(), msg_count };
-    }));
-    res.json({ chats: enriched, total });
-  } catch { res.status(500).json({ error: 'Could not load chats' }); }
-});
-
-app.get('/api/admin/chats/:id/messages', adminGuard, async (req, res) => {
-  try {
-    const chat = await Chat.findById(req.params.id).populate('user_id', 'username email').lean();
-    if (!chat) return res.status(404).json({ error: 'Not found' });
-    const messages = await Message.find({ chat_id: req.params.id }).sort({ created_at: 1 }).lean();
-    res.json({ chat: { ...chat, id: chat._id.toString(), _id: undefined }, messages: fmtArr(messages), user: { username: chat.user_id?.username, email: chat.user_id?.email } });
-  } catch { res.status(500).json({ error: 'Failed' }); }
-});
-
-app.delete('/api/admin/chats/:id', adminGuard, async (req, res) => {
-  try {
-    await Message.deleteMany({ chat_id: req.params.id });
-    await Chat.findByIdAndDelete(req.params.id);
-    await sysLog('warn', 'admin', `Admin deleted chat ${req.params.id}`);
-    res.json({ success: true });
-  } catch { res.status(500).json({ error: 'Failed' }); }
-});
-
-/* ── NOTIFICATIONS ───────────────────────────────────────────── */
-app.get('/api/admin/notifications', adminGuard, async (req, res) => {
-  try { res.json(fmtArr(await Notification.find().sort({ created_at: -1 }).limit(50).lean())); }
-  catch { res.json([]); }
-});
-
-app.post('/api/admin/notifications', adminGuard, async (req, res) => {
-  const { title, message, type = 'info', expires_at } = req.body;
-  if (!title || !message) return res.status(400).json({ error: 'Title and message required' });
-  try {
-    const notif = await Notification.create({ title, message, type, is_active: true, created_by: req.admin.id, expires_at: expires_at || null });
-    const io = req.app.get('io'); if (io) io.emit('admin_notification', fmt(notif));
-    await sysLog('info', 'admin', `Notification: ${title}`);
-    logActivity('broadcast', { username: req.admin.username, meta: { title } });
-    res.json(fmt(notif));
-  } catch { res.status(500).json({ error: 'Failed' }); }
-});
-
-app.put('/api/admin/notifications/:id', adminGuard, async (req, res) => {
-  try { await Notification.findByIdAndUpdate(req.params.id, { is_active: !!req.body.is_active }); res.json({ success: true }); }
-  catch { res.status(500).json({ error: 'Failed' }); }
-});
-
-app.delete('/api/admin/notifications/:id', adminGuard, async (req, res) => {
-  try { await Notification.findByIdAndDelete(req.params.id); res.json({ success: true }); }
-  catch { res.status(500).json({ error: 'Failed' }); }
-});
-
-/* ── SETTINGS ────────────────────────────────────────────────── */
-app.get('/api/admin/settings', adminGuard, (_, res) => res.json({ ...cfg, groq_model: process.env.GROQ_MODEL || DEFAULT_MODEL }));
-app.put('/api/admin/settings', adminGuard, async (req, res) => {
-  try {
-    const allowedSettings = [
-      'max_tokens', 'temperature', 'system_prompt', 'image_gen_enabled',
-      'file_uploads_enabled', 'maintenance_mode', 'app_name', 'max_context_messages',
-      'blocked_ips', 'cost_per_1k_tokens', 'free_daily_limit', 'premium_daily_limit',
-      'moderation_enabled', 'knowledge_base_enabled'
-    ];
-    const safeSettings = Object.fromEntries(
-      allowedSettings.filter(key => Object.prototype.hasOwnProperty.call(req.body, key))
-        .map(key => [key, req.body[key]])
-    );
-    cfg = { ...cfg, ...safeSettings };
-    saveCfg();
-    await sysLog('info', 'admin', `Settings updated by ${req.admin.username}`);
-    const io = req.app.get('io');
-    if (io && req.body.maintenance_mode !== undefined) io.emit('maintenance_mode', { active: req.body.maintenance_mode });
-    res.json({ success: true, settings: { ...cfg, groq_model: process.env.GROQ_MODEL || DEFAULT_MODEL } });
-  } catch { res.status(500).json({ error: 'Failed to save settings' }); }
-});
-
-/* ── USAGE & BILLING ─────────────────────────────────────────── */
-app.get('/api/admin/usage', adminGuard, async (req, res) => {
-  try {
-    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    const [tokenAgg, total_requests, success_requests, by_user, by_day, plans] = await Promise.all([
-      UsageTracking.aggregate([{ $group: { _id: null, total: { $sum: '$tokens_used' } } }]),
-      UsageTracking.countDocuments(),
-      UsageTracking.countDocuments({ success: true }),
-      UsageTracking.aggregate([
-        { $group: { _id: '$user_id', tokens: { $sum: '$tokens_used' }, requests: { $sum: 1 } } },
-        { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'user' } },
-        { $unwind: '$user' },
-        { $project: { username: '$user.username', tokens: 1, requests: 1, _id: 0 } },
-        { $sort: { tokens: -1 } }, { $limit: 10 }
-      ]),
-      UsageTracking.aggregate([
-        { $match: { created_at: { $gte: thirtyDaysAgo } } },
-        { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$created_at' } }, tokens: { $sum: '$tokens_used' }, requests: { $sum: 1 }, avg_ms: { $avg: '$response_ms' } } },
-        { $sort: { _id: 1 } }, { $project: { date: '$_id', tokens: 1, requests: 1, avg_ms: 1, _id: 0 } }
-      ]),
-      UserPlan.aggregate([{ $group: { _id: '$plan', count: { $sum: 1 } } }, { $project: { plan: '$_id', count: 1, _id: 0 } }])
-    ]);
-    const total_tokens = tokenAgg[0]?.total || 0;
-    const total_cost = (total_tokens / 1000 * (cfg.cost_per_1k_tokens || 0.002)).toFixed(4);
-    res.json({ total_tokens, total_requests, success_requests, total_cost, by_user, by_day, plans });
-  } catch { res.json({ total_tokens: 0, total_requests: 0, total_cost: 0, by_user: [], by_day: [], plans: [] }); }
-});
-
-/* ── MODERATION ──────────────────────────────────────────────── */
-app.get('/api/admin/moderation', adminGuard, async (req, res) => {
-  try {
-    const flagged = await FlaggedContent.find({ reviewed: false })
-      .populate('message_id', 'content')
-      .populate('user_id', 'username')
-      .sort({ created_at: -1 }).limit(50).lean();
-    res.json(flagged.map(f => ({
-      ...f, id: f._id.toString(), _id: undefined,
-      content: f.message_id?.content,
-      username: f.user_id?.username,
-    })));
-  } catch { res.json([]); }
-});
-
-app.put('/api/admin/moderation/:id/review', adminGuard, async (req, res) => {
-  try { await FlaggedContent.findByIdAndUpdate(req.params.id, { reviewed: true }); res.json({ success: true }); }
-  catch { res.status(500).json({ error: 'Failed' }); }
-});
-
-/* ── KNOWLEDGE BASE ──────────────────────────────────────────── */
-app.get('/api/admin/knowledge', adminGuard, async (req, res) => {
-  try { res.json(fmtArr(await KnowledgeBase.find().select('title file_type created_at').sort({ created_at: -1 }).lean())); }
-  catch { res.json([]); }
-});
-
-app.post('/api/admin/knowledge', adminGuard, upload.single('file'), async (req, res) => {
-  const { title, content } = req.body;
-  if (!title) return res.status(400).json({ error: 'Title required' });
-  try {
-    let fileContent = content || '';
-    let fileUrl = null, fileType = 'text';
-    if (req.file) {
-      fileUrl = `/uploads/${req.file.filename}`;
-      fileType = req.file.mimetype;
-      const extracted = extractTextFromFile(req.file.path);
-      if (extracted) fileContent = extracted;
-    }
-    if (!fileContent) return res.status(400).json({ error: 'Content or file required' });
-    const kb = await KnowledgeBase.create({ title, content: fileContent, file_url: fileUrl, file_type: fileType, uploaded_by: req.admin.id });
-    res.json({ id: kb._id.toString(), title, success: true });
-  } catch { res.status(500).json({ error: 'Failed to add knowledge' }); }
-});
-
-app.delete('/api/admin/knowledge/:id', adminGuard, async (req, res) => {
-  try { await KnowledgeBase.findByIdAndDelete(req.params.id); res.json({ success: true }); }
-  catch { res.status(500).json({ error: 'Failed' }); }
-});
-
-/* ── FILES ───────────────────────────────────────────────────── */
-app.get('/api/admin/files', adminGuard, async (req, res) => {
-  try {
-    const dir = './uploads';
-    if (!fs.existsSync(dir)) return res.json({ files: [], total_size: 0 });
-    const files = fs.readdirSync(dir).map(name => {
-      const stat = fs.statSync(`${dir}/${name}`);
-      const ext = name.split('.').pop()?.toLowerCase() || '';
-      return { name, size: stat.size, created: stat.birthtime, url: `/uploads/${name}`, type: /^(jpg|jpeg|png|gif|webp|svg)$/.test(ext) ? 'image' : 'file', ext };
-    }).sort((a, b) => new Date(b.created) - new Date(a.created));
-    res.json({ files, total_size: files.reduce((s, f) => s + f.size, 0) });
-  } catch { res.json({ files: [], total_size: 0 }); }
-});
-
-app.delete('/api/admin/files/:name', adminGuard, async (req, res) => {
-  try {
-    const p = `./uploads/${req.params.name.replace(/\.\./g, '')}`;
-    if (fs.existsSync(p)) fs.unlinkSync(p);
-    await sysLog('warn', 'admin', `Deleted file: ${req.params.name}`);
-    res.json({ success: true });
-  } catch { res.status(500).json({ error: 'Failed' }); }
-});
-
-/* ── VISITORS ────────────────────────────────────────────────── */
-app.get('/api/admin/visitors', adminGuard, async (req, res) => {
-  try {
-    const last24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
-    const [totalAgg, todayAgg, by_page, by_hour, recent] = await Promise.all([
-      PageView.aggregate([{ $group: { _id: '$session_id' } }, { $count: 'total' }]),
-      PageView.aggregate([{ $match: { created_at: { $gte: todayStart } } }, { $group: { _id: '$session_id' } }, { $count: 'total' }]),
-      PageView.aggregate([{ $group: { _id: '$page', views: { $sum: 1 } } }, { $sort: { views: -1 } }, { $limit: 10 }, { $project: { page: '$_id', views: 1, _id: 0 } }]),
-      PageView.aggregate([
-        { $match: { created_at: { $gte: last24h } } },
-        { $group: { _id: { $hour: '$created_at' }, views: { $sum: 1 } } },
-        { $sort: { _id: 1 } }, { $project: { hour: '$_id', views: 1, _id: 0 } }
-      ]),
-      PageView.find().sort({ created_at: -1 }).limit(20).lean()
-    ]);
-    res.json({ total: totalAgg[0]?.total || 0, today: todayAgg[0]?.total || 0, by_page, by_hour, recent: fmtArr(recent) });
-  } catch { res.json({ total: 0, today: 0, by_page: [], by_hour: [], recent: [] }); }
-});
-
-/* ── LOGS ────────────────────────────────────────────────────── */
-app.get('/api/admin/logs', adminGuard, async (req, res) => {
-  const { level, page = 1, limit = 50 } = req.query;
-  const skip = (parseInt(page) - 1) * parseInt(limit);
-  try {
-    const filter = level && level !== 'all' ? { level } : {};
-    const [logs, total] = await Promise.all([
-      SystemLog.find(filter).sort({ created_at: -1 }).skip(skip).limit(parseInt(limit)).lean(),
-      SystemLog.countDocuments(filter)
-    ]);
-    res.json({ logs: fmtArr(logs), total });
-  } catch { res.json({ logs: [], total: 0 }); }
-});
-
-/* ── SECURITY ────────────────────────────────────────────────── */
-app.get('/api/admin/security', adminGuard, async (req, res) => {
-  try {
-    const suspicious = await PageView.aggregate([
-      { $match: { ip_address: { $ne: null } } },
-      { $group: { _id: '$ip_address', hits: { $sum: 1 }, last_seen: { $max: '$created_at' } } },
-      { $sort: { hits: -1 } }, { $limit: 20 },
-      { $project: { ip_address: '$_id', hits: 1, last_seen: 1, _id: 0 } }
-    ]);
-    res.json({ blocked_ips: cfg.blocked_ips || [], suspicious });
-  } catch { res.json({ blocked_ips: [], suspicious: [] }); }
-});
-
-app.post('/api/admin/security/block-ip', adminGuard, async (req, res) => {
-  const { ip } = req.body;
-  if (!ip) return res.status(400).json({ error: 'IP required' });
-  try {
-    if (!cfg.blocked_ips) cfg.blocked_ips = [];
-    if (!cfg.blocked_ips.includes(ip)) cfg.blocked_ips.push(ip);
-    saveCfg(); await sysLog('warn', 'admin', `Blocked IP: ${ip}`);
-    res.json({ success: true });
-  } catch { res.status(500).json({ error: 'Failed' }); }
-});
-
-app.delete('/api/admin/security/block-ip/:ip', adminGuard, async (req, res) => {
-  try {
-    cfg.blocked_ips = (cfg.blocked_ips || []).filter(i => i !== req.params.ip);
-    saveCfg(); res.json({ success: true });
-  } catch { res.status(500).json({ error: 'Failed' }); }
-});
-
-/* ── ADMINS LIST ─────────────────────────────────────────────── */
-app.get('/api/admin/admins', adminGuard, async (req, res) => {
-  try { res.json(fmtArr(await Admin.find().select('username email role created_at last_login').sort({ created_at: 1 }).lean())); }
-  catch { res.json([]); }
-});
-
-app.delete('/api/admin/admins/:id', adminGuard, async (req, res) => {
-  if (req.admin.id === req.params.id) return res.status(400).json({ error: 'Cannot delete yourself' });
-  try { await Admin.findByIdAndDelete(req.params.id); res.json({ success: true }); }
-  catch { res.status(500).json({ error: 'Failed' }); }
-});
-
-/* ── EXPORT ──────────────────────────────────────────────────── */
-app.get('/api/admin/export/users', adminGuard, async (req, res) => {
-  try {
-    const users = await User.find().select('username email profession referral_source onboarded is_banned created_at last_login').sort({ created_at: -1 }).lean();
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename=users.csv');
-    const header = 'id,username,email,profession,referral,onboarded,banned,created_at,last_login\n';
-    const rows = users.map(u => `${u._id},"${u.username}","${u.email}","${u.profession || ''}","${u.referral_source || ''}",${u.onboarded},${u.is_banned},"${u.created_at}","${u.last_login || ''}"`).join('\n');
-    res.send(header + rows);
-  } catch { res.status(500).json({ error: 'Export failed' }); }
-});
-
-app.get('/api/admin/export/chats', adminGuard, async (req, res) => {
-  try {
-    const chats = await Chat.find().populate('user_id', 'username email').sort({ created_at: -1 }).lean();
-    const enriched = await Promise.all(chats.map(async c => ({
-      ...c, msg_count: await Message.countDocuments({ chat_id: c._id })
-    })));
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename=chats.csv');
-    const header = 'id,title,username,email,messages,created_at,updated_at\n';
-    const rows = enriched.map(c => `${c._id},"${c.title}","${c.user_id?.username || ''}","${c.user_id?.email || ''}",${c.msg_count},"${c.created_at}","${c.updated_at}"`).join('\n');
-    res.send(header + rows);
-  } catch { res.status(500).json({ error: 'Export failed' }); }
-});
-
-/* ── AI TEST PANEL ───────────────────────────────────────────── */
-app.post('/api/admin/ai/test', adminGuard, async (req, res) => {
-  const { prompt } = req.body;
-  if (!prompt) return res.status(400).json({ error: 'Prompt required' });
-  const start = Date.now();
-  try {
-    const data = await completeWithGroq({
-      history: [{ role: 'user', content: prompt }],
-      systemPrompt: cfg.system_prompt,
-      maxTokens: cfg.max_tokens,
-      temperature: cfg.temperature
-    });
-    res.json({ response: data.text, model: data.model, response_ms: Date.now() - start, status: 'success' });
-  } catch (err) { res.status(503).json({ error: friendlyError(err), response_ms: Date.now() - start }); }
-});
-
-/* ── PERFORMANCE ─────────────────────────────────────────────── */
-app.get('/api/admin/performance', adminGuard, async (req, res) => {
-  try {
-    const last24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const [avgAgg, errorAgg, by_hour] = await Promise.all([
-      UsageTracking.aggregate([{ $match: { success: true } }, { $group: { _id: null, avg: { $avg: '$response_ms' } } }]),
-      UsageTracking.aggregate([
-        { $match: { created_at: { $gte: last24h } } },
-        { $group: { _id: null, total: { $sum: 1 }, errors: { $sum: { $cond: ['$success', 0, 1] } } } }
-      ]),
-      UsageTracking.aggregate([
-        { $match: { created_at: { $gte: last24h } } },
-        { $group: { _id: { $hour: '$created_at' }, avg_ms: { $avg: '$response_ms' }, requests: { $sum: 1 } } },
-        { $sort: { _id: 1 } }, { $project: { hour: '$_id', avg_ms: 1, requests: 1, _id: 0 } }
-      ])
-    ]);
-    res.json({ avg_response_ms: Math.round(avgAgg[0]?.avg || 0), error_rate: errorAgg[0] || { total: 0, errors: 0 }, by_hour, uptime_ms: process.uptime() * 1000, memory: process.memoryUsage() });
-  } catch { res.json({ avg_response_ms: 0, error_rate: { total: 0, errors: 0 }, by_hour: [] }); }
-});
+const adminRouter = require('./routes/admin');
+app.use('/api/admin', adminRouter);
 
 /* ── HEALTH ──────────────────────────────────────────────────── */
 app.get('/api/health', (_, res) => res.json({ status: 'ok', version: '7.0.0', db: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected', uptime: process.uptime(), memory: process.memoryUsage().rss, timestamp: new Date().toISOString() }));
@@ -1833,6 +1320,7 @@ const { Server } = require('socket.io');
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: true, credentials: true } });
 app.set('io', io);
+attachIo(io); // services/activity.js emits live events through this
 
 io.use((socket, next) => {
   const t = socket.handshake.auth?.token;
@@ -1888,9 +1376,16 @@ app.use((err, req, res, next) => {
 });
 
 /* ── START ───────────────────────────────────────────────────── */
-connectDB().then(() => {
+connectDB().then(async () => {
+  // Normalize legacy admin roles — KinyaBot has exactly ONE role:
+  // super_admin. Any legacy 'admin'/'moderator' rows are upgraded.
+  try {
+    const r = await Admin.updateMany({ role: { $ne: 'super_admin' } }, { $set: { role: 'super_admin' } });
+    if (r.modifiedCount) console.log(`✅ Normalized ${r.modifiedCount} admin account(s) to super_admin`);
+  } catch {}
   server.listen(PORT, () => {
-    console.log(`\n✅ KinyaBot v7.0 (MongoDB) → http://localhost:${PORT}`);
-    console.log(`   Admin  → http://localhost:5173/admin\n`);
+    const pkg = require('./package.json');
+    console.log(`\n✅ KinyaBot v${pkg.version} (MongoDB) → http://localhost:${PORT}`);
+    console.log(`   Superadmin  → http://localhost:5173/admin\n`);
   });
 });
