@@ -23,16 +23,18 @@ const fs       = require('fs')
 const {
   User, Chat, Message, Admin, Notification, AdminNotification, AuditLog,
   SecurityEvent, PageView, SystemLog, UserMemory, KnowledgeBase,
-  UsageTracking, UserPlan, FlaggedContent,
+  UsageTracking, UserPlan, FlaggedContent, PlanConfig, UsageDaily, PlanRequest,
 } = require('../models')
 
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'kinyabot_admin_secret_change_me'
 const aiConfig      = require('../services/ai/config')
 const provider      = require('../services/ai/groqProvider')
 const settings      = require('../services/settings')
+const plansService  = require('../services/plans')
+const usageService  = require('../services/usage')
 const { onlinePresence, logActivity } = require('../services/activity')
 const { writeAudit } = require('../services/audit')
-const { notifyAdmins } = require('../services/notify')
+const { notifyAdmins, notifyUser } = require('../services/notify')
 const pushService   = require('../services/push')
 const healthCheck   = require('../services/healthCheck')
 
@@ -209,6 +211,10 @@ router.get('/overview', async (req, res) => {
 
     const recent_users = await User.find().select('username email avatar_url is_banned created_at last_login').sort({ created_at: -1 }).limit(6).lean()
 
+    // Subscription statistics (§23) — computed from real data; 0 when empty
+    let subscription = null
+    try { subscription = await subscriptionStats(30) } catch { subscription = null }
+
     res.json({
       range: r,
       users: {
@@ -228,6 +234,7 @@ router.get('/overview', async (req, res) => {
       },
       moderation: { pending: pending_flags },
       notifications_unread: unread_notifs,
+      subscription,
       series: { users: userSeries, messages: msgSeries, ai: aiSeries },
       recent_users: recent_users.map(u => ({ id: u._id.toString(), username: u.username, email: u.email, is_banned: u.is_banned, created_at: u.created_at, last_login: u.last_login })),
       generated_at: new Date().toISOString(),
@@ -313,6 +320,36 @@ router.get('/analytics', async (req, res) => {
       ]),
     ])
 
+    // Plan analytics (§24) — real upgrade funnel + consumption by plan
+    const [reqSeries, convAgg, consByPlan] = await Promise.all([
+      PlanRequest.aggregate([
+        { $match: { created_at: { $gte: start } } },
+        { $group: { _id: fmt, total: { $sum: 1 }, approved: { $sum: { $cond: [{ $eq: ['$status', 'approved'] }, 1, 0] } }, rejected: { $sum: { $cond: [{ $eq: ['$status', 'rejected'] }, 1, 0] } } } },
+        { $sort: { _id: 1 } }, { $project: { date: '$_id', total: 1, approved: 1, rejected: 1, _id: 0 } },
+      ]),
+      PlanRequest.aggregate([
+        { $match: { created_at: { $gte: start } } },
+        { $group: { _id: '$status', count: { $sum: 1 } } },
+      ]),
+      UsageDaily.aggregate([
+        { $match: { date: { $gte: new Date(Date.now() - 7 * 864e5).toISOString().slice(0, 10) } } },
+        { $lookup: { from: 'userplans', localField: 'user_id', foreignField: 'user_id', as: 'up' } },
+        { $addFields: { plan: { $ifNull: [{ $first: '$up.plan' }, 'free'] } } },
+        { $group: { _id: '$plan', chats_used: { $sum: '$chats_used' }, users: { $sum: 1 } } },
+        { $project: { plan: '$_id', chats_used: 1, users: 1, _id: 0 } },
+      ]).catch(() => []),
+    ])
+
+    const reqTotal = convAgg.reduce((s, c) => s + c.count, 0)
+    const approvedN = convAgg.find(c => c._id === 'approved')?.count || 0
+    const rejectedN = convAgg.find(c => c._id === 'rejected')?.count || 0
+    const conversionPairs = await PlanRequest.aggregate([
+      { $match: { status: 'approved', created_at: { $gte: start } } },
+      { $group: { _id: { from: '$current_plan', to: '$requested_plan' }, count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $project: { _id: 0, label: { $concat: ['$_id.from', ' → ', '$_id.to'] }, count: 1 } },
+    ]).catch(() => [])
+
     res.json({
       range: r,
       users: {
@@ -334,6 +371,14 @@ router.get('/analytics', async (req, res) => {
         tokens: ai.tokens, series: aiSeries, by_model: byModel,
       },
       engagement: { hourly_activity: hourly, top_users: topUsers, views_total, views_range, top_pages: by_page },
+      plans: {
+        requests: { total: reqTotal, approved: approvedN, rejected: rejectedN,
+          approval_rate: reqTotal ? Math.round((approvedN / reqTotal) * 1000) / 10 : 0,
+          rejection_rate: reqTotal ? Math.round((rejectedN / reqTotal) * 1000) / 10 : 0,
+          series: reqSeries },
+        conversions: conversionPairs,
+        consumption_by_plan: consByPlan,
+      },
     })
   } catch (err) {
     console.error('[Analytics]', err)
@@ -1191,6 +1236,325 @@ router.get('/export/chats', async (req, res) => {
     const rows = chats.map(c => `${c._id},"${c.title}","${c.username || ''}","${c.email || ''}",${c.msg_count},"${c.created_at}","${c.updated_at}"`).join('\n')
     res.send(header + rows)
   } catch { res.status(500).json({ error: 'Export failed' }) }
+})
+
+/* ════════════════════════════════════════════════════════════════
+   PLANS & SUBSCRIPTIONS (§12-§16, §21, §23)
+   Manual upgrade workflow — SuperAdmin reviews real PlanRequest
+   records; every decision is validated, audited and notified.
+════════════════════════════════════════════════════════════════ */
+function fmtPlanRequest(doc) {
+  const obj = doc.toObject ? doc.toObject({ virtuals: false }) : { ...doc }
+  obj.id = obj._id?.toString()
+  delete obj._id; delete obj.__v
+  for (const k of ['user_id']) {
+    if (obj[k] instanceof mongoose.Types.ObjectId) obj[k] = obj[k].toString()
+  }
+  return obj
+}
+
+const PLAN_REQUEST_SORTS = {
+  newest:         { created_at: -1 },
+  oldest:         { created_at: 1 },
+  requested_plan: { requested_plan: -1, created_at: -1 },
+  status:         { status: 1, created_at: -1 },
+}
+
+router.get('/plan-requests', async (req, res) => {
+  const page  = Math.max(1, parseInt(req.query.page) || 1)
+  const limit = Math.min(50, Math.max(5, parseInt(req.query.limit) || 20))
+  const status = ['pending', 'approved', 'rejected'].includes(req.query.status) ? req.query.status : ''
+  const search = String(req.query.search || '').trim()
+  const sort   = PLAN_REQUEST_SORTS[req.query.sort] || PLAN_REQUEST_SORTS.newest
+  try {
+    const filter = {}
+    if (status) filter.status = status
+    if (search) {
+      const rx = { $regex: escapeRegex(search), $options: 'i' }
+      filter.$or = [{ full_name: rx }, { email: rx }, { phone: rx }, { requested_plan: rx }]
+      // Direct request-ID lookup support
+      if (mongoose.Types.ObjectId.isValid(search)) filter.$or.push({ _id: new mongoose.Types.ObjectId(search) })
+    }
+
+    const [items, total, counts] = await Promise.all([
+      PlanRequest.aggregate([
+        { $match: filter },
+        { $sort: sort },
+        { $skip: (page - 1) * limit }, { $limit: limit },
+        { $lookup: { from: 'users', localField: 'user_id', foreignField: '_id', as: 'user' } },
+        { $addFields: {
+          username: { $ifNull: [{ $first: '$user.username' }, null] },
+          user_deleted: { $eq: [{ $size: '$user' }, 0] },
+        } },
+        { $project: { user: 0 } },
+      ]),
+      PlanRequest.countDocuments(filter),
+      PlanRequest.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]),
+    ])
+
+    const byStatus = { pending: 0, approved: 0, rejected: 0 }
+    counts.forEach(c => { byStatus[c._id] = c.count })
+
+    res.json({
+      requests: items.map(r => ({ ...r, id: r._id.toString(), _id: undefined })),
+      total, page, pages: Math.ceil(total / limit) || 1,
+      counts: byStatus,
+    })
+  } catch (err) { console.error('[PlanRequests]', err); res.status(500).json({ error: 'Could not load plan requests' }) }
+})
+
+/* Full detail for the review drawer — user + subscription + request. */
+router.get('/plan-requests/:id', async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: 'Request not found' })
+    const request = await PlanRequest.findById(req.params.id)
+    if (!request) return res.status(404).json({ error: 'Request not found' })
+
+    const [user, userPlan] = await Promise.all([
+      User.findById(request.user_id).select('username email created_at last_login is_banned').lean(),
+      UserPlan.findOne({ user_id: request.user_id }).lean(),
+    ])
+    const currentPlanCfg = await plansService.getPlan(userPlan?.plan || 'free')
+    const requestedPlanCfg = await plansService.getPlan(request.requested_plan)
+
+    res.json({
+      request: fmtPlanRequest(request),
+      user: user ? { id: user._id.toString(), username: user.username, email: user.email, created_at: user.created_at, last_login: user.last_login, is_banned: user.is_banned, deleted: false } : { deleted: true },
+      subscription: {
+        currentPlan: userPlan?.plan || 'free',
+        currentPlanStatus: userPlan?.status || 'active',
+        currentDailyLimit: currentPlanCfg?.dailyChatLimit || 50,
+        requestedPlan: request.requested_plan,
+        requestedDailyLimit: requestedPlanCfg?.dailyChatLimit || null,
+      },
+    })
+  } catch (err) { console.error('[PlanRequestDetail]', err); res.status(500).json({ error: 'Could not load request' }) }
+})
+
+/* APPROVE (§14) — atomic on the request row, audited, notified. */
+router.post('/plan-requests/:id/approve', async (req, res) => {
+  const notes = String(req.body?.notes || '').trim().slice(0, 500)
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: 'Request not found' })
+
+    // 1. Atomically claim the PENDING request — a concurrent double-click
+    //    can never approve twice (status guard inside the filter).
+    const request = await PlanRequest.findOneAndUpdate(
+      { _id: req.params.id, status: 'pending' },
+      { $set: {
+          status: 'approved',
+          reviewed_at: new Date(),
+          reviewed_by: req.admin.username,
+          reviewed_by_id: req.admin.id,
+          approval_notes: notes || null,
+        } },
+      { new: true }
+    )
+    if (!request) {
+      const existing = await PlanRequest.findById(req.params.id).select('status').lean()
+      return res.status(existing ? 409 : 404).json({ error: existing ? 'This request was already reviewed.' : 'Request not found' })
+    }
+
+    // 2. Validate the user still exists (§14.1)
+    const user = await User.findById(request.user_id).select('username email is_banned').lean()
+    if (!user) {
+      await PlanRequest.updateOne({ _id: request._id }, { $set: { status: 'pending', reviewed_at: null, reviewed_by: null, reviewed_by_id: null, approval_notes: null } })
+      return res.status(410).json({ error: 'The user account for this request no longer exists.' })
+    }
+
+    // 3. Update the user's plan (single authoritative source: UserPlan)
+    const userPlan = await plansService.getUserPlanDoc(request.user_id)
+    const planCfg = await plansService.getPlan(request.requested_plan)
+    const from = userPlan.plan
+    userPlan.plan = request.requested_plan
+    userPlan.daily_limit = planCfg?.dailyChatLimit || userPlan.daily_limit
+    userPlan.status = 'active'
+    userPlan.activation_source = 'manual_admin_approval'
+    userPlan.activated_by = req.admin.username
+    userPlan.activated_at = new Date()
+    userPlan.previous_plan = from
+    userPlan.last_change = { from, to: request.requested_plan, at: new Date(), ack: false }
+    await userPlan.save()
+
+    // 4. Audit + activity + notifications (§21, §22)
+    await writeAudit(req.admin, 'PLAN_UPGRADE_APPROVED', {
+      resourceType: 'plan_request', resourceId: request._id.toString(), resourceLabel: `${user.username}: ${from} → ${request.requested_plan}`,
+      meta: { user_id: String(request.user_id), previous_plan: from, new_plan: request.requested_plan, daily_limit: userPlan.daily_limit }, req,
+    })
+    await writeAudit(req.admin, 'PLAN_CHANGED', {
+      resourceType: 'user_plan', resourceId: String(request.user_id), resourceLabel: user.username,
+      meta: { previous_plan: from, new_plan: request.requested_plan, request_id: request._id.toString(), daily_limit: userPlan.daily_limit }, req,
+    })
+    logActivity('plan_changed', { username: user.username, user_id: String(request.user_id), meta: { from, to: request.requested_plan } })
+
+    const newPlanName = (planCfg?.name || request.requested_plan).toUpperCase()
+    notifyUser(request.user_id, {
+      type: 'success',
+      title: 'Upgrade approved',
+      message: `Your ${request.requested_plan.charAt(0).toUpperCase() + request.requested_plan.slice(1)} upgrade has been approved. Your account now includes ${userPlan.daily_limit} chats/day.`,
+      kind: 'plan_updated',
+      meta: { plan: request.requested_plan, dailyLimit: userPlan.daily_limit },
+    })
+    // Realtime plan refresh for every live session of the user
+    const io = req.app.get('io')
+    if (io) io.to(`user_${String(request.user_id)}`).emit('plan_updated', {
+      plan: request.requested_plan, dailyLimit: userPlan.daily_limit, previousPlan: from,
+    })
+
+    notifyAdmins({
+      title: 'Upgrade request approved',
+      message: `${req.admin.username} approved ${user.username}'s upgrade to ${request.requested_plan} (${from} → ${request.requested_plan}).`,
+      type: 'success', category: 'user', link: '/admin/plan-requests',
+      resource: { kind: 'plan_request', id: request._id.toString() }, dedupeKey: `plan-approved-${request._id}`, push: false,
+    }).catch(() => {})
+
+    res.json({ request: fmtPlanRequest(request), previousPlan: from, newPlan: request.requested_plan, dailyLimit: userPlan.daily_limit })
+  } catch (err) { console.error('[PlanApprove]', err); res.status(500).json({ error: 'Could not approve the request' }) }
+})
+
+/* REJECT (§15) — user plan untouched, request marked rejected. */
+router.post('/plan-requests/:id/reject', async (req, res) => {
+  const reason = String(req.body?.reason || '').trim().slice(0, 500)
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: 'Request not found' })
+    const request = await PlanRequest.findOneAndUpdate(
+      { _id: req.params.id, status: 'pending' },
+      { $set: {
+          status: 'rejected',
+          reviewed_at: new Date(),
+          reviewed_by: req.admin.username,
+          reviewed_by_id: req.admin.id,
+          rejection_reason: reason || null,
+        } },
+      { new: true }
+    )
+    if (!request) {
+      const existing = await PlanRequest.findById(req.params.id).select('status').lean()
+      return res.status(existing ? 409 : 404).json({ error: existing ? 'This request was already reviewed.' : 'Request not found' })
+    }
+
+    const user = await User.findById(request.user_id).select('username').lean()
+    // User's UserPlan is intentionally NOT touched (§15)
+
+    await writeAudit(req.admin, 'PLAN_UPGRADE_REJECTED', {
+      resourceType: 'plan_request', resourceId: request._id.toString(),
+      resourceLabel: user ? `${user.username}: ${request.requested_plan}` : request.requested_plan,
+      meta: { user_id: String(request.user_id), requested_plan: request.requested_plan, current_plan: request.current_plan, reason: reason || null }, req,
+    })
+
+    notifyUser(request.user_id, {
+      type: 'warning',
+      title: 'Upgrade request rejected',
+      message: `Your ${request.requested_plan.charAt(0).toUpperCase() + request.requested_plan.slice(1)} upgrade request was not approved${reason ? `: ${reason}` : '.'}`,
+      kind: 'plan_request_rejected',
+      meta: { requestId: request._id.toString(), plan: request.requested_plan },
+    })
+    const io = req.app.get('io')
+    if (io) io.to(`user_${String(request.user_id)}`).emit('plan_request_rejected', { requestId: request._id.toString(), plan: request.requested_plan })
+
+    notifyAdmins({
+      title: 'Upgrade request rejected',
+      message: `${req.admin.username} rejected ${user?.username || 'a user'}'s upgrade to ${request.requested_plan}.`,
+      type: 'info', category: 'user', link: '/admin/plan-requests',
+      resource: { kind: 'plan_request', id: request._id.toString() }, dedupeKey: `plan-rejected-${request._id}`, push: false,
+    }).catch(() => {})
+
+    res.json({ request: fmtPlanRequest(request) })
+  } catch (err) { console.error('[PlanReject]', err); res.status(500).json({ error: 'Could not reject the request' }) }
+})
+
+/* ── Plan configuration (§2 — SuperAdmin edits limits/flags live) ── */
+router.get('/plans', async (req, res) => {
+  try {
+    const docs = await PlanConfig.find({}).sort({ sort_order: 1 }).lean()
+    res.json({ plans: docs.map(plansService.normalizePlan) })
+  } catch { res.status(500).json({ error: 'Could not load plans' }) }
+})
+
+router.put('/plans/:planId', async (req, res) => {
+  const planId = String(req.params.planId).toLowerCase()
+  if (!plansService.PLAN_IDS.includes(planId)) return res.status(404).json({ error: 'Unknown plan' })
+  const { patch, error } = plansService.validatePlanPatch(req.body || {})
+  if (error) return res.status(400).json({ error })
+  try {
+    const before = await PlanConfig.findOne({ plan_id: planId }).lean()
+    if (!before) return res.status(404).json({ error: 'Unknown plan' })
+    const updated = await PlanConfig.findOneAndUpdate({ plan_id: planId }, { $set: patch }, { new: true })
+    plansService.invalidateCache()
+    await writeAudit(req.admin, 'PLAN_CONFIG_UPDATED', {
+      resourceType: 'plan_config', resourceId: planId, resourceLabel: before.name,
+      meta: { before: { daily_chat_limit: before.daily_chat_limit, context_messages: before.context_messages, features: before.features }, after: patch }, req,
+    })
+    notifyAdmins({
+      title: 'Plan configuration updated',
+      message: `${req.admin.username} updated the ${before.name} plan.`,
+      type: 'info', category: 'config', link: '/admin/plan-requests', dedupeKey: `plan-config-${req.admin.id}`, push: false,
+    }).catch(() => {})
+    res.json({ plan: plansService.normalizePlan(updated) })
+  } catch (err) { console.error('[PlanConfigUpdate]', err); res.status(500).json({ error: 'Could not update plan' }) }
+})
+
+/* ── Subscription statistics (§23) — real aggregations only ───── */
+async function subscriptionStats(rangeDays = 30) {
+  const today = usageService.todayKey()
+  const since = new Date(Date.now() - rangeDays * 864e5)
+
+  const [totalUsers, planCounts, reqCounts] = await Promise.all([
+    User.countDocuments(),
+    UserPlan.aggregate([{ $group: { _id: '$plan', count: { $sum: 1 } } }]),
+    PlanRequest.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]),
+  ])
+
+  const byPlan = { free: 0, plus: 0, pro: 0 }
+  planCounts.forEach(p => { if (byPlan[p._id] !== undefined) byPlan[p._id] = p.count })
+  // Users without a UserPlan document are implicitly FREE (§43)
+  byPlan.free = Math.max(0, totalUsers - (byPlan.plus + byPlan.pro))
+
+  const byStatus = { pending: 0, approved: 0, rejected: 0 }
+  reqCounts.forEach(r => { if (byStatus[r._id] !== undefined) byStatus[r._id] = r.count })
+
+  const [todayUsage] = await UsageDaily.aggregate([
+    { $match: { date: today } },
+    { $lookup: { from: 'userplans', localField: 'user_id', foreignField: 'user_id', as: 'up' } },
+    { $addFields: { plan: { $ifNull: [{ $first: '$up.plan' }, 'free'] } } },
+    { $lookup: { from: 'planconfigs', localField: 'plan', foreignField: 'plan_id', as: 'pc' } },
+    { $addFields: { limit: { $ifNull: [{ $first: '$pc.daily_chat_limit' }, 50] } } },
+    { $addFields: { ratio: { $cond: [{ $gt: ['$limit', 0] }, { $divide: ['$chats_used', '$limit'] }, 0] } } },
+    { $facet: {
+      overall: [{ $group: {
+        _id: null,
+        chats_used: { $sum: '$chats_used' },
+        active_users: { $sum: 1 },
+        near_limit: { $sum: { $cond: [{ $and: [{ $gte: ['$ratio', 0.8] }, { $lt: ['$ratio', 1] }] }, 1, 0] } },
+        reached_limit: { $sum: { $cond: [{ $gte: ['$ratio', 1] }, 1, 0] } },
+      } }],
+      byPlan: [{ $group: { _id: '$plan', chats_used: { $sum: '$chats_used' }, users: { $sum: 1 } } }, { $project: { plan: '$_id', chats_used: 1, users: 1, _id: 0 } }],
+    } },
+  ]).catch(() => [null])
+
+  const overall = todayUsage?.overall?.[0] || { chats_used: 0, active_users: 0, near_limit: 0, reached_limit: 0 }
+
+  const conversions = await PlanRequest.aggregate([
+    { $match: { status: 'approved', reviewed_at: { $gte: since } } },
+    { $group: { _id: { from: '$current_plan', to: '$requested_plan' }, count: { $sum: 1 } } },
+    { $project: { _id: 0, from: '$_id.from', to: '$_id.to', count: 1 } },
+  ]).catch(() => [])
+
+  return {
+    plans: byPlan,
+    requests: byStatus,
+    today: {
+      date: today, chats_used: overall.chats_used, active_users: overall.active_users,
+      near_limit: overall.near_limit, reached_limit: overall.reached_limit,
+      by_plan: todayUsage?.byPlan || [],
+    },
+    conversions,
+  }
+}
+
+router.get('/subscription-stats', async (req, res) => {
+  try { res.json(await subscriptionStats(30)) }
+  catch (err) { console.error('[SubscriptionStats]', err); res.status(500).json({ error: 'Could not load subscription statistics' }) }
 })
 
 module.exports = router

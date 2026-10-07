@@ -22,6 +22,12 @@ function emitToAdmins(event, payload) {
   if (ioRef) ioRef.to('admin_room').emit(event, payload)
 }
 
+/** Emit to every live socket connection of one user (user_<id> room).
+ *  Used for realtime user notifications (plan updates, usage alerts). */
+function emitToUser(userId, event, payload) {
+  if (ioRef && userId) ioRef.to(`user_${String(userId)}`).emit(event, payload)
+}
+
 /**
  * Record a real activity event.
  * @param {string} action  machine name, e.g. 'register', 'ai_request_failed'
@@ -38,4 +44,4 @@ async function logActivity(action, { username = null, user_id = null, meta = nul
   return entry
 }
 
-module.exports = { attachIo, onlinePresence, logActivity, emitToAdmins }
+module.exports = { attachIo, onlinePresence, logActivity, emitToAdmins, emitToUser }

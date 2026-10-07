@@ -21,10 +21,13 @@ const documentService = require('./documentService')
 const CHARS_PER_TOKEN = 4
 
 /* ── Load + bound history ────────────────────────────────────── */
-async function loadHistory(chatId, { excludeMessageId = null } = {}) {
+/* maxRows lets callers widen the fetched window per plan (higher
+   plans keep more conversation context — services/plans.js). */
+async function loadHistory(chatId, { excludeMessageId = null, maxRows = null } = {}) {
+  const fetchLimit = Math.max(Number(maxRows) || 0, config.context.maxMessages, config.context.summarizeAfter) + 4
   const rows = await Message.find({ chat_id: chatId })
     .sort({ created_at: -1, _id: -1 })
-    .limit(Math.max(config.context.maxMessages, config.context.summarizeAfter) + 4)
+    .limit(fetchLimit)
     .lean()
   let history = rows.reverse()
   if (excludeMessageId) history = history.filter(m => String(m._id) !== String(excludeMessageId))

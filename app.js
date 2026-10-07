@@ -23,8 +23,11 @@ const documentService = require('./services/ai/documentService');
 const speechService   = require('./services/ai/speechService');
 const rateLimiter     = require('./services/rateLimiter');
 const settings        = require('./services/settings');
+const plansService    = require('./services/plans');
+const usageService    = require('./services/usage');
+const authGuard       = require('./services/authGuard');
 const { attachIo, onlinePresence, logActivity } = require('./services/activity');
-const { notifyAdmins } = require('./services/notify');
+const { notifyAdmins, notifyUser } = require('./services/notify');
 const pushService     = require('./services/push');
 
 const {
@@ -104,6 +107,12 @@ const upload = multer({
 // Attachments are now served exclusively through the authenticated,
 // ownership-checked GET /api/files/:name endpoint (see CHAT ROUTES).
 const CHAT_FILE_FILTER = /\.(jpg|jpeg|png|gif|webp|pdf|txt|md|csv|json|docx|py|js|ts|html|css|xml|yaml|yml|mp3|wav|m4a|ogg|webm|flac|aac|mp4)$/i;
+// Hard cap covers the largest plan document allowance (Pro = 4× base);
+// per-plan limits are enforced inside the route handlers (§27).
+const CHAT_UPLOAD_MAX_BYTES = Math.max(
+  aiConfig.limits.imageSizeBytes,
+  aiConfig.limits.documentSizeBytes * 4
+);
 const uploadChat = multer({
   storage: multer.diskStorage({
     destination(_, __, cb) {
@@ -115,7 +124,7 @@ const uploadChat = multer({
       cb(null, `c_${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`);
     }
   }),
-  limits: { fileSize: Math.max(aiConfig.limits.imageSizeBytes, aiConfig.limits.documentSizeBytes) },
+  limits: { fileSize: CHAT_UPLOAD_MAX_BYTES },
   fileFilter(_, file, cb) { cb(null, CHAT_FILE_FILTER.test(file.originalname)); }
 });
 const uploadAudio = multer({
@@ -201,12 +210,8 @@ async function sendInviteEmail(to, inviterName, workspaceName) {
 }
 
 /* ── MIDDLEWARES ─────────────────────────────────────────────── */
-function authGuard(req, res, next) {
-  const h = req.headers.authorization;
-  if (!h?.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
-  try { req.user = jwt.verify(h.slice(7), JWT_SECRET); next(); }
-  catch { res.status(401).json({ error: 'Session expired. Please log in again.' }); }
-}
+/* authGuard now lives in services/authGuard.js (shared with the
+   modular routers) — imported above. */
 function adminGuard(req, res, next) {
   const h = req.headers.authorization;
   if (!h?.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
@@ -253,6 +258,64 @@ function estimateTokens(text) { return Math.ceil((text || '').length / 4); }
 
 async function sysLog(level, source, message, data, userId) {
   try { await SystemLog.create({ level, source, message, data: data || null, user_id: userId || null }); } catch {}
+}
+
+/* ══════════════════════════════════════════════════════════════
+   PLAN SYSTEM — plan-aware request plumbing (§1-§4, §27, §36)
+   The plan configuration is DB-backed (services/plans.js) so the
+   SuperAdmin can change limits/flags without touching code.
+══════════════════════════════════════════════════════════════ */
+
+/** Resolve the caller's plan + configuration (one indexed read;
+ *  plan config itself is cached in-process for 15s). */
+async function getPlanContext(userId) {
+  const planDoc = await plansService.getUserPlanDoc(userId).catch(() => null);
+  const planCfg = await plansService.getPlan(planDoc?.plan || 'free');
+  return { plan: planDoc?.plan || 'free', planStatus: planDoc?.status || 'active', planCfg };
+}
+
+/** Structured 429 for a reached daily limit (§3, §7).
+ *  The AI provider is NEVER called in this path. */
+function limitReachedResponse(res, usage) {
+  return res.status(429).json({
+    error: `You have used all ${usage.limit} chats available on your ${usage.planName} plan today. Your limit resets tomorrow.`,
+    code: 'DAILY_LIMIT_REACHED',
+    usage: {
+      used: usage.used, limit: usage.limit, remaining: 0,
+      percent: 100, state: 'limit', plan: usage.plan, planName: usage.planName, date: usage.date,
+    },
+  });
+}
+
+/** Atomic daily-chat reservation (§36). Returns the reservation or
+ *  null after answering with a structured limit-reached response. */
+async function reserveChatUsage(req, res, { count = 1 } = {}) {
+  const reservation = await usageService.consume(req.user.id, { count });
+  if (reservation.ok) return reservation;
+  limitReachedResponse(res, reservation.usage);
+  return null;
+}
+
+/** Give a reserved chat back exactly once — failed AI turns must not
+ *  count as successful chats (§36). Idempotent per reservation. */
+async function refundReservation(req, reservation) {
+  if (!reservation || reservation.refunded || reservation.completed) return;
+  reservation.refunded = true;
+  try { await usageService.refund(req.user.id, { count: reservation.count || 1 }); } catch {}
+}
+
+/** Per-plan request-capability guard (§27) — used by feature routes. */
+async function featureGuard(req, res, feature, message) {
+  const { plan, planStatus } = await getPlanContext(req.user.id);
+  if (!['active', 'pending'].includes(planStatus)) {
+    res.status(403).json({ error: 'Your subscription is not active. Please contact support.', code: 'SUBSCRIPTION_INACTIVE' });
+    return null;
+  }
+  if (!(await plansService.canUseFeature(plan, feature))) {
+    res.status(403).json({ error: message, code: 'FEATURE_LOCKED', feature });
+    return null;
+  }
+  return { plan };
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -497,9 +560,10 @@ app.post('/api/auth/login', async (req, res) => {
     }
     user.last_login = new Date();
     await user.save();
+    const planDoc = await UserPlan.findOne({ user_id: user._id }).select('plan status').lean();
     const token = jwt.sign({ id: user._id.toString(), username: user.username, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
     logActivity('login', { username: user.username, user_id: user._id.toString() });
-    res.json({ token, user: { id: user._id.toString(), username: user.username, email: user.email, avatar_url: user.avatar_url, onboarded: user.onboarded, profession: user.profession, email_verified: user.email_verified } });
+    res.json({ token, user: { id: user._id.toString(), username: user.username, email: user.email, avatar_url: user.avatar_url, onboarded: user.onboarded, profession: user.profession, email_verified: user.email_verified, plan: planDoc?.plan || 'free' } });
   } catch (err) { console.error('[Login]', err); res.status(500).json({ error: 'Login failed. Please try again.' }); }
 });
 
@@ -539,7 +603,10 @@ app.get('/api/auth/me', authGuard, async (req, res) => {
   try {
     const user = await User.findById(req.user.id).select('username email avatar_url profession onboarded email_verified usage_type workspace_name use_cases created_at last_login').lean();
     if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json({ ...user, id: user._id.toString(), _id: undefined });
+    // Plan comes from the authoritative UserPlan document (backend is
+    // the single source of truth — §19). Missing doc ⇒ FREE (§43).
+    const planDoc = await UserPlan.findOne({ user_id: req.user.id }).select('plan status').lean();
+    res.json({ ...user, id: user._id.toString(), _id: undefined, plan: planDoc?.plan || 'free', plan_status: planDoc?.status || 'active' });
   } catch { res.status(500).json({ error: 'Could not fetch profile' }); }
 });
 
@@ -784,14 +851,14 @@ function codeDeliveryPrompt(userText = '') {
   return [
     'Code delivery requirements: The user asked you to create or implement software. Deliver the actual complete working source code; do not answer with instructions to copy code, a description without code, or claims that files were created.',
     singleFile
-      ? 'The user requested one file. Return exactly one complete file in one fenced code block with a descriptive filename immediately after the language, for example ```html filename=hotel-booking.html. Include all required HTML, CSS and JavaScript in that file when applicable.'
+      ? 'The user requested one file. Return exactly one complete file in one fenced code block. Include all required HTML, CSS and JavaScript in that file when applicable.'
       : 'Return every required source file in its own fenced code block. Put its relative filename immediately after the language on the opening fence, for example ```html filename=index.html or ```jsx filename=src/App.jsx. Include all code needed for the requested deliverable.',
     'Use valid Markdown code fences and always close every fence. Keep any explanation brief and outside the code blocks. Never claim that code was executed, tested, or written to disk.'
   ].join(' ')
 }
 
 /* ── Shared assistant turn (real Groq streaming, SSE) ────────── */
-async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = 'chat' }) {
+async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = 'chat', reservation = null, planCfg = null }) {
   const abortController = new AbortController();
   let clientClosed = false;
   req.on('close', () => { clientClosed = true; try { abortController.abort(new Error('client closed')); } catch {} });
@@ -799,9 +866,12 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
   const chatId = String(chat._id);
   const memory = await getUserMemory(req.user.id);
 
-  // Context: bounded window + budget trim + rolling summary (§5)
-  const fullHistory = await chatService.loadHistory(chatId);
-  const { kept, droppedCount } = chatService.trimToBudget(fullHistory);
+  // Context: plan-aware bounded window + budget trim + rolling summary (§5)
+  // Higher plans keep more recent messages in context (advancedContext).
+  const planContextMult = planCfg?.contextMessages ? Math.min(8, Math.max(1, planCfg.contextMessages / 10)) : 1;
+  const planBudgetTokens = Math.round(aiConfig.context.tokenBudget * planContextMult);
+  const fullHistory = await chatService.loadHistory(chatId, { maxRows: planCfg?.contextMessages || null });
+  const { kept, droppedCount } = chatService.trimToBudget(fullHistory, planBudgetTokens);
   const summary = await chatService.ensureSummary(chat, kept, droppedCount);
   const ragContext = cfg.knowledge_base_enabled ? await searchKnowledgeBase(kept[kept.length - 1]?.content || '') : '';
   const documentContext = chatService.findRecentDocumentContext(kept);
@@ -865,14 +935,14 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
 
   let aiText = '';
   let usageTokens = null;
-  const stream = await provider.chatCompleteStream({
-    messages, model,
-    maxTokens: codeDelivery ? Math.max(Number(cfg.max_tokens) || 2048, 8192) : cfg.max_tokens,
-    temperature: cfg.temperature,
-    signal: abortController.signal,
-  });
-
   try {
+    const stream = await provider.chatCompleteStream({
+      messages, model,
+      maxTokens: codeDelivery ? Math.max(Number(cfg.max_tokens) || 2048, 8192) : cfg.max_tokens,
+      temperature: cfg.temperature,
+      signal: abortController.signal,
+    });
+
     for await (const chunk of stream) {
       const delta = chunk.choices?.[0]?.delta?.content || '';
       if (chunk.usage?.total_tokens) usageTokens = chunk.usage.total_tokens;
@@ -880,7 +950,12 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
       if (clientClosed) break;
     }
   } catch (err) {
-    if (!clientClosed) throw err;
+    if (!clientClosed) {
+      // The AI request failed — give the reserved chat back (§36:
+      // failed requests must not count as successful chats).
+      await refundReservation(req, reservation);
+      throw err;
+    }
   }
 
   // Client cancelled mid-generation → keep the partial answer honestly (§17)
@@ -895,7 +970,10 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
     return;
   }
 
-  if (!aiText.trim()) { const e = new Error('EMPTY_AI_RESPONSE'); e.code = 'EMPTY_AI_RESPONSE'; throw e; }
+  if (!aiText.trim()) {
+    await refundReservation(req, reservation);
+    const e = new Error('EMPTY_AI_RESPONSE'); e.code = 'EMPTY_AI_RESPONSE'; throw e;
+  }
 
   // Source references ONLY when the backend actually knows them (§7)
   const sources = (!imageDataUrl && documentContext)
@@ -909,6 +987,7 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
   });
   chat.updated_at = new Date();
   await chat.save();
+  if (reservation) reservation.completed = true; // AI turn fully served
 
   const tokens = usageTokens || estimateTokens(messages.map(m => (m.content || (Array.isArray(m.content) ? m.content.map(c => c.text || '').join(' ') : '')).slice(0, 400)).join('\n') + aiText);
   await trackUsage(req.user.id, chatId, tokens, trackType, Date.now() - startedAt, true);
@@ -918,6 +997,14 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
   if (io) {
     io.to(`chat_${chatId}`).emit('new_message', { userMessage: null, aiMessage: fmtMessage(aiMsg), chatId });
     io.to(`user_${req.user.id}`).emit('chat_updated', { chatId });
+    // Live usage refresh for the sidebar indicator (§5, §28)
+    if (reservation?.usage) {
+      io.to(`user_${req.user.id}`).emit('usage_updated', {
+        used: reservation.usage.used, limit: reservation.usage.limit,
+        remaining: Math.max(0, reservation.usage.limit - reservation.usage.used),
+        plan: reservation.usage.plan, state: reservation.usage.state,
+      });
+    }
   }
 
   send('done', { aiMessage: fmtMessage(aiMsg), userMessage: null });
@@ -951,18 +1038,29 @@ app.post('/api/chats/:id/messages/stream', authGuard, uploadChat.single('file'),
   const chatId = req.params.id;
   if (!content && !req.file) return res.status(400).json({ error: 'Message or file required' });
 
-  // Abuse protection (§20): burst rate + existing daily quota
-  const rl = rateLimiter.allow(req.user.id, 'chat', aiConfig.rateLimits.chat);
+  // Plan context first (one indexed read; config cached) — drives the
+  // burst limits, upload allowances and context budget for this turn.
+  const { plan, planStatus, planCfg } = await getPlanContext(req.user.id);
+  if (!['active', 'pending'].includes(planStatus))
+    return res.status(403).json({ error: 'Your subscription is not active. Please contact support.', code: 'SUBSCRIPTION_INACTIVE' });
+
+  // Abuse protection (§20): plan-scaled burst limits.
+  const mult = planCfg?.burstMultiplier || 1;
+  const rl = rateLimiter.allow(req.user.id, 'chat', {
+    limit: Math.round(aiConfig.rateLimits.chat.limit * mult),
+    windowMs: aiConfig.rateLimits.chat.windowMs,
+  });
   if (!rl.ok) return rateLimiter.tooMany(res, rl.retryAfterSec);
   if (req.file) {
-    const ul = rateLimiter.allow(req.user.id, 'upload', aiConfig.rateLimits.upload);
+    const ul = rateLimiter.allow(req.user.id, 'upload', {
+      limit: Math.round(aiConfig.rateLimits.upload.limit * mult),
+      windowMs: aiConfig.rateLimits.upload.windowMs,
+    });
     if (!ul.ok) return rateLimiter.tooMany(res, ul.retryAfterSec);
   }
-  const quota = await rateLimiter.dailyQuotaOk(req.user.id, cfg.free_daily_limit);
-  if (!quota.ok)
-    return res.status(429).json({ error: `You have reached your daily limit of ${quota.limit} messages. Your quota resets tomorrow.` });
 
   const startTime = Date.now();
+  let reservation = null;
 
   try {
     const chat = await Chat.findOne({ _id: chatId, user_id: req.user.id });
@@ -982,6 +1080,20 @@ app.post('/api/chats/:id/messages/stream', authGuard, uploadChat.single('file'),
     try { prepared = prepareAttachment(req); }
     catch (err) { return res.status(400).json({ error: friendlyError(err) }); }
 
+    // Plan-based document allowance: documents beyond the caller's plan
+    // limit are rejected BEFORE the AI is involved (§1, §27).
+    if (prepared.meta?.kind === 'document' && req.file) {
+      const base = aiConfig.limits.documentSizeBytes;
+      const docLimit = Math.round(base * (planCfg?.docSizeMultiplier || 1));
+      if (req.file.size > docLimit) {
+        try { fs.unlinkSync(req.file.path); } catch {}
+        return res.status(413).json({
+          error: `That document is too large for your ${planCfg?.name || 'current'} plan. Maximum size is ${(docLimit / (1024 * 1024)).toFixed(0)} MB.`,
+          code: 'PLAN_SIZE_LIMIT', upgradeHint: plan !== 'pro',
+        });
+      }
+    }
+
     let documentExtract = null;
     if (prepared.needsExtract) {
       try {
@@ -991,6 +1103,12 @@ app.post('/api/chats/:id/messages/stream', authGuard, uploadChat.single('file'),
         return res.status(422).json({ error: friendlyError(err), attachmentSaved: false });
       }
     }
+
+    // Atomic daily-chat reservation — happens AFTER every validation so
+    // rejected requests never consume allowance, and BEFORE the AI call
+    // so an over-limit request never reaches the provider (§3, §36).
+    const reservation = await reserveChatUsage(req, res);
+    if (!reservation) return;
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -1022,9 +1140,10 @@ app.post('/api/chats/:id/messages/stream', authGuard, uploadChat.single('file'),
       await chat.save();
     }
 
-    await runAssistantTurn(req, res, { chat, send, startedAt: startTime, trackType: prepared.messageType === 'image' ? 'image' : (prepared.messageType === 'document' ? 'document' : 'chat') });
+    await runAssistantTurn(req, res, { chat, send, startedAt: startTime, trackType: prepared.messageType === 'image' ? 'image' : (prepared.messageType === 'document' ? 'document' : 'chat'), reservation, planCfg });
   } catch (err) {
     console.error('[Stream]', err);
+    await refundReservation(req, reservation);
     // Headers may not be sent yet if a pre-stream step threw
     if (!res.headersSent) {
       res.setHeader('Content-Type', 'text/event-stream');
@@ -1041,12 +1160,18 @@ app.post('/api/chats/:id/messages/stream', authGuard, uploadChat.single('file'),
 /* ── REGENERATE last response (SSE, §16) ─────────────────────── */
 app.post('/api/chats/:id/regenerate/stream', authGuard, async (req, res) => {
   const chatId = req.params.id;
-  const rl = rateLimiter.allow(req.user.id, 'chat', aiConfig.rateLimits.chat);
-  if (!rl.ok) return rateLimiter.tooMany(res, rl.retryAfterSec);
-  const quota = await rateLimiter.dailyQuotaOk(req.user.id, cfg.free_daily_limit);
-  if (!quota.ok)
-    return res.status(429).json({ error: `You have reached your daily limit of ${quota.limit} messages. Your quota resets tomorrow.` });
 
+  const { plan, planStatus, planCfg } = await getPlanContext(req.user.id);
+  if (!['active', 'pending'].includes(planStatus))
+    return res.status(403).json({ error: 'Your subscription is not active. Please contact support.', code: 'SUBSCRIPTION_INACTIVE' });
+  const mult = planCfg?.burstMultiplier || 1;
+  const rl = rateLimiter.allow(req.user.id, 'chat', {
+    limit: Math.round(aiConfig.rateLimits.chat.limit * mult),
+    windowMs: aiConfig.rateLimits.chat.windowMs,
+  });
+  if (!rl.ok) return rateLimiter.tooMany(res, rl.retryAfterSec);
+
+  let reservation = null;
   try {
     const chat = await Chat.findOne({ _id: chatId, user_id: req.user.id });
     if (!chat) return res.status(404).json({ error: 'Chat not found' });
@@ -1057,6 +1182,10 @@ app.post('/api/chats/:id/regenerate/stream', authGuard, async (req, res) => {
     // Drop assistant messages generated after the last user message
     await Message.deleteMany({ chat_id: chatId, role: 'assistant', _id: { $gt: lastUser._id } });
 
+    // Atomic daily-chat reservation — regenerate consumes allowance too
+    reservation = await reserveChatUsage(req, res);
+    if (!reservation) return;
+
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
@@ -1065,9 +1194,10 @@ app.post('/api/chats/:id/regenerate/stream', authGuard, async (req, res) => {
     const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     send('user_message', fmtMessage(lastUser));
 
-    await runAssistantTurn(req, res, { chat, send, startedAt: Date.now(), trackType: 'regenerate' });
+    await runAssistantTurn(req, res, { chat, send, startedAt: Date.now(), trackType: 'regenerate', reservation, planCfg });
   } catch (err) {
     console.error('[Regenerate]', err);
+    await refundReservation(req, reservation);
     if (!res.headersSent) { res.setHeader('Content-Type', 'text/event-stream'); res.flushHeaders(); }
     try { res.write(`event: error\ndata: ${JSON.stringify({ message: friendlyError(err) })}\n\n`); res.end(); } catch { res.end(); }
   }
@@ -1075,6 +1205,8 @@ app.post('/api/chats/:id/regenerate/stream', authGuard, async (req, res) => {
 
 /* ── SPEECH-TO-TEXT (voice input, §11/§12) ───────────────────── */
 app.post('/api/stt', authGuard, uploadAudio.single('audio'), async (req, res) => {
+  // Plan feature gate (§27) — voiceAccess is a per-plan capability flag
+  if (!(await featureGuard(req, res, 'voiceAccess', 'Voice input is not included in your current plan. Upgrade to enable it.'))) return;
   const rl = rateLimiter.allow(req.user.id, 'stt', aiConfig.rateLimits.stt);
   if (!rl.ok) return rateLimiter.tooMany(res, rl.retryAfterSec);
   if (!req.file) return res.status(400).json({ error: 'No audio received.' });
@@ -1096,6 +1228,7 @@ app.post('/api/stt', authGuard, uploadAudio.single('audio'), async (req, res) =>
 
 /* ── TEXT-TO-SPEECH (voice output, §13) ──────────────────────── */
 app.post('/api/tts', authGuard, async (req, res) => {
+  if (!(await featureGuard(req, res, 'voiceAccess', 'Voice output is not included in your current plan. Upgrade to enable it.'))) return;
   const rl = rateLimiter.allow(req.user.id, 'tts', aiConfig.rateLimits.tts);
   if (!rl.ok) return rateLimiter.tooMany(res, rl.retryAfterSec);
   const { text } = req.body;
@@ -1114,19 +1247,23 @@ app.post('/api/tts', authGuard, async (req, res) => {
 });
 
 /* ── SEND MESSAGE (non-streaming fallback) ───────────────────── */
-/* ── SEND MESSAGE (non-streaming fallback) ───────────────────── */
 app.post('/api/chats/:id/messages', authGuard, uploadChat.single('file'), async (req, res) => {
   const { content } = req.body;
   const chatId = req.params.id;
   if (!content && !req.file) return res.status(400).json({ error: 'Message or file required' });
   const startTime = Date.now();
 
-  const rl = rateLimiter.allow(req.user.id, 'chat', aiConfig.rateLimits.chat);
+  const { plan, planStatus, planCfg } = await getPlanContext(req.user.id);
+  if (!['active', 'pending'].includes(planStatus))
+    return res.status(403).json({ error: 'Your subscription is not active. Please contact support.', code: 'SUBSCRIPTION_INACTIVE' });
+  const mult = planCfg?.burstMultiplier || 1;
+  const rl = rateLimiter.allow(req.user.id, 'chat', {
+    limit: Math.round(aiConfig.rateLimits.chat.limit * mult),
+    windowMs: aiConfig.rateLimits.chat.windowMs,
+  });
   if (!rl.ok) return rateLimiter.tooMany(res, rl.retryAfterSec);
-  const quota = await rateLimiter.dailyQuotaOk(req.user.id, cfg.free_daily_limit);
-  if (!quota.ok)
-    return res.status(429).json({ error: `You have reached your daily limit of ${quota.limit} messages. Your quota resets tomorrow.` });
 
+  let reservation = null;
   try {
     const chat = await Chat.findOne({ _id: chatId, user_id: req.user.id });
     if (!chat) return res.status(404).json({ error: 'Chat not found' });
@@ -1143,11 +1280,28 @@ app.post('/api/chats/:id/messages', authGuard, uploadChat.single('file'), async 
     try { prepared = prepareAttachment(req); }
     catch (err) { return res.status(400).json({ error: friendlyError(err) }); }
 
+    // Plan-based document allowance (§27)
+    if (prepared.meta?.kind === 'document' && req.file) {
+      const docLimit = Math.round(aiConfig.limits.documentSizeBytes * (planCfg?.docSizeMultiplier || 1));
+      if (req.file.size > docLimit) {
+        try { fs.unlinkSync(req.file.path); } catch {}
+        return res.status(413).json({
+          error: `That document is too large for your ${planCfg?.name || 'current'} plan. Maximum size is ${(docLimit / (1024 * 1024)).toFixed(0)} MB.`,
+          code: 'PLAN_SIZE_LIMIT', upgradeHint: plan !== 'pro',
+        });
+      }
+    }
+
     let documentExtract = null;
     if (prepared.needsExtract) {
       try { documentExtract = await documentService.extractText(req.file.path, req.file.originalname, req.file.mimetype); }
       catch (err) { return res.status(422).json({ error: friendlyError(err) }); }
     }
+
+    // Atomic daily-chat reservation (§3, §36) — after validations,
+    // before any AI provider call.
+    reservation = await reserveChatUsage(req, res);
+    if (!reservation) return;
 
     const meta = prepared.meta ? { ...prepared.meta } : null;
     if (meta && documentExtract) { meta.extracted_text = documentExtract.text; meta.pages = documentExtract.pages; }
@@ -1163,9 +1317,10 @@ app.post('/api/chats/:id/messages', authGuard, uploadChat.single('file'), async 
     const msgCount = await Message.countDocuments({ chat_id: chatId });
     if (msgCount <= 1 && content) { chat.title = content.slice(0, 60); await chat.save(); }
 
-    // Context via AI Core (bounded window + budget + rolling summary)
-    const fullHistory = await chatService.loadHistory(chatId);
-    const { kept, droppedCount } = chatService.trimToBudget(fullHistory);
+    // Context via AI Core (plan-aware bounded window + budget + rolling summary)
+    const planContextMult = planCfg?.contextMessages ? Math.min(8, Math.max(1, planCfg.contextMessages / 10)) : 1;
+    const fullHistory = await chatService.loadHistory(chatId, { maxRows: planCfg?.contextMessages || null });
+    const { kept, droppedCount } = chatService.trimToBudget(fullHistory, Math.round(aiConfig.context.tokenBudget * planContextMult));
     const summary = await chatService.ensureSummary(chat, kept, droppedCount);
     const memory = await getUserMemory(req.user.id);
     const ragCtx = cfg.knowledge_base_enabled && content ? await searchKnowledgeBase(content) : '';
@@ -1185,27 +1340,38 @@ app.post('/api/chats/:id/messages', authGuard, uploadChat.single('file'), async 
       }
     }
 
-    if (prepared.imageDataUrl || priorImage) {
-      const historyText = kept.filter(m => !(String(m._id) === String(userMsg._id)) && m.content?.trim())
-        .slice(-6).map(m => ({ role: m.role, content: m.content.trim() }));
-      result = await provider.visionComplete({
-        prompt: content || (prepared.imageDataUrl ? 'What is in this image? Describe it in detail.' : `Tell me more about this image (${priorImage.name}).`),
-        imageDataUrl: prepared.imageDataUrl || priorImage.dataUrl,
-        history: historyText, systemPrompt: cfg.system_prompt,
-        maxTokens: cfg.max_tokens, temperature: cfg.temperature,
-      });
-    } else {
-      const messages = chatService.buildMessages({
-        systemPrompt: cfg.system_prompt, memory, ragContext: ragCtx,
-        history: kept, summary, documentContext,
-        userText: content || '',
-      });
-      result = await provider.chatComplete({
-        messages, model: chatService.pickModel({}),
-        maxTokens: cfg.max_tokens, temperature: cfg.temperature,
-      });
+    try {
+      if (prepared.imageDataUrl || priorImage) {
+        const historyText = kept.filter(m => !(String(m._id) === String(userMsg._id)) && m.content?.trim())
+          .slice(-6).map(m => ({ role: m.role, content: m.content.trim() }));
+        result = await provider.visionComplete({
+          prompt: content || (prepared.imageDataUrl ? 'What is in this image? Describe it in detail.' : `Tell me more about this image (${priorImage.name}).`),
+          imageDataUrl: prepared.imageDataUrl || priorImage.dataUrl,
+          history: historyText, systemPrompt: cfg.system_prompt,
+          maxTokens: cfg.max_tokens, temperature: cfg.temperature,
+        });
+      } else {
+        const messages = chatService.buildMessages({
+          systemPrompt: cfg.system_prompt, memory, ragContext: ragCtx,
+          history: kept, summary, documentContext,
+          userText: content || '',
+        });
+        result = await provider.chatComplete({
+          messages, model: chatService.pickModel({}),
+          maxTokens: cfg.max_tokens, temperature: cfg.temperature,
+        });
+      }
+    } catch (err) {
+      // AI never produced a usable answer — refund the reservation (§36)
+      await refundReservation(req, reservation);
+      throw err;
     }
-    const aiText = result.text;
+    const aiText = result?.text || '';
+    if (!aiText.trim()) {
+      await refundReservation(req, reservation);
+      return res.status(502).json({ error: friendlyError(new Error('EMPTY_AI_RESPONSE')) });
+    }
+    if (reservation) reservation.completed = true;
 
     const sources = (!prepared.imageDataUrl && documentContext)
       ? [`${documentContext.name}${documentContext.pages ? ` (${documentContext.pages} pages)` : ''}`]
@@ -1285,20 +1451,30 @@ app.get('/api/stats', authGuard, async (req, res) => {
 app.get('/api/usage', authGuard, async (req, res) => {
   try {
     const uid = new mongoose.Types.ObjectId(req.user.id);
-    const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+    // Authoritative daily usage: UsageDaily counter (services/usage.js)
+    const u = await usageService.getUsage(req.user.id);
     const monthStart = new Date(); monthStart.setDate(1); monthStart.setHours(0, 0, 0, 0);
-    const today = await UsageTracking.countDocuments({ user_id: uid, created_at: { $gte: todayStart } });
     const month = await UsageTracking.countDocuments({ user_id: uid, created_at: { $gte: monthStart } });
     const tokenAgg = await UsageTracking.aggregate([
       { $match: { user_id: uid } },
       { $group: { _id: null, total: { $sum: '$tokens_used' } } }
     ]);
     const tokens = tokenAgg[0]?.total || 0;
-    const plan = await UserPlan.findOne({ user_id: uid }).lean();
-    const daily_limit = plan?.daily_limit || cfg.free_daily_limit;
-    res.json({ today, month, tokens, daily_limit, remaining: Math.max(0, daily_limit - today) });
-  } catch { res.json({ today: 0, month: 0, tokens: 0, daily_limit: 50, remaining: 50 }); }
+    res.json({
+      today: u.used, month, tokens,
+      daily_limit: u.limit, remaining: u.remaining,
+      plan: u.plan, planName: u.planName, state: u.state, date: u.date,
+    });
+  } catch { res.json({ today: 0, month: 0, tokens: 0, daily_limit: 50, remaining: 50, plan: 'free' }); }
 });
+
+/* ════════════════════════════════════════════════════════════
+   PLANS & SUBSCRIPTION (modular router — §33)
+   GET /api/plans · GET /api/subscription · GET /api/subscription/usage
+   POST /api/subscription/requests · GET /api/subscription/requests
+   POST /api/subscription/ack-plan
+════════════════════════════════════════════════════════════ */
+app.use('/api', require('./routes/subscription'));
 /* ══════════════════════════════════════════════════════════════
    SUPERADMIN API (v2) — implemented in routes/admin.js
    One administrative role: super_admin. Every endpoint verifies
@@ -1328,7 +1504,7 @@ const adminRouter = require('./routes/admin');
 app.use('/api/admin', adminRouter);
 
 /* ── HEALTH ──────────────────────────────────────────────────── */
-app.get('/api/health', (_, res) => res.json({ status: 'ok', version: '7.0.0', db: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected', uptime: process.uptime(), memory: process.memoryUsage().rss, timestamp: new Date().toISOString() }));
+app.get('/api/health', (_, res) => res.json({ status: 'ok', version: '7.1.0', db: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected', uptime: process.uptime(), memory: process.memoryUsage().rss, timestamp: new Date().toISOString() }));
 
 /* ══════════════════════════════════════════════════════════════
    SOCKET.IO
@@ -1401,6 +1577,22 @@ connectDB().then(async () => {
     const r = await Admin.updateMany({ role: { $ne: 'super_admin' } }, { $set: { role: 'super_admin' } });
     if (r.modifiedCount) console.log(`✅ Normalized ${r.modifiedCount} admin account(s) to super_admin`);
   } catch {}
+  // Plan system (§43 migration safety): seed plan configuration and
+  // migrate legacy plan values. Users WITHOUT a UserPlan document are
+  // implicitly FREE — no backfill needed, existing accounts keep working.
+  try {
+    await plansService.ensureSeed();
+    const migrated = await UserPlan.updateMany(
+      { plan: { $in: ['premium', 'enterprise'] } },
+      { $set: { plan: 'pro', daily_limit: 500, status: 'active', activation_source: 'manual_admin_approval' } }
+    );
+    if (migrated.modifiedCount) console.log(`✅ Migrated ${migrated.modifiedCount} legacy premium/enterprise plan(s) to pro`);
+    const statuses = await UserPlan.updateMany(
+      { status: { $in: [null, ''] } },
+      { $set: { status: 'active' } }
+    );
+    if (statuses.modifiedCount) console.log(`✅ Normalized ${statuses.modifiedCount} plan status(es) to active`);
+  } catch (err) { console.error('[Plans] startup seed/migration failed:', err.message); }
   server.listen(PORT, () => {
     const pkg = require('./package.json');
     console.log(`\n✅ KinyaBot v${pkg.version} (MongoDB) → http://localhost:${PORT}`);

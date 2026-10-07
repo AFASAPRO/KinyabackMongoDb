@@ -244,13 +244,105 @@ usageTrackingSchema.index({ success: 1, created_at: -1 });
 usageTrackingSchema.index({ request_type: 1, created_at: -1 });
 
 /* ── USER PLAN ────────────────────────────────────────────────── */
+/* KinyaBot plan system: FREE / PLUS / PRO.
+   One document per user — users without a document are treated as
+   FREE by services/plans.js, so existing accounts keep working.
+   Legacy 'premium'/'enterprise' values are normalized to 'pro'
+   at startup (see app.js).                                      */
 const userPlanSchema = new Schema({
-  user_id:       { type: Schema.Types.ObjectId, ref: 'User', required: true, unique: true },
-  plan:          { type: String, enum: ['free', 'premium', 'enterprise'], default: 'free' },
-  daily_limit:   { type: Number, default: 50 },
-  monthly_limit: { type: Number, default: 500 },
-  tokens_limit:  { type: Number, default: 100000 },
+  user_id:       { type: Schema.Types.ObjectId, ref: 'User', required: true, unique: true, index: true },
+  plan:          { type: String, enum: ['free', 'plus', 'pro'], default: 'free' },
+  daily_limit:   { type: Number, default: 50 },   // denormalized snapshot at assignment time
+  monthly_limit: { type: Number, default: 0 },
+  tokens_limit:  { type: Number, default: 0 },
+  // Subscription lifecycle (§26). Manual approvals only for now —
+  // payment providers can set activation_source later (§25).
+  status:            { type: String, enum: ['active', 'pending', 'expired', 'cancelled', 'suspended'], default: 'active' },
+  activation_source: { type: String, enum: ['manual_admin_approval', 'stripe', 'paypal', 'other'], default: 'manual_admin_approval' },
+  activated_by:      { type: String, default: null },   // admin username
+  activated_at:      { type: Date,   default: null },
+  previous_plan:     { type: String, default: null },
+  // Last plan change awaiting user acknowledgement (celebration UI)
+  last_change: {
+    from: { type: String, default: null },
+    to:   { type: String, default: null },
+    at:   { type: Date,   default: null },
+    ack:  { type: Boolean, default: true },
+  },
 }, { timestamps: { createdAt: false, updatedAt: 'updated_at' } });
+
+userPlanSchema.index({ plan: 1 });
+
+/* ── PLAN CONFIG (centralized, SuperAdmin-editable) ─────────────
+   One document per plan. The application NEVER hard-codes plan
+   limits — services/plans.js reads these (cached) so limits and
+   feature flags can change without code changes (§2).            */
+const planConfigSchema = new Schema({
+  plan_id:  { type: String, required: true, unique: true, lowercase: true, trim: true }, // free | plus | pro
+  name:     { type: String, required: true },
+  tagline:  { type: String, default: '' },
+  daily_chat_limit:  { type: Number, required: true, min: 1, max: 100000 },
+  context_messages:  { type: Number, default: 10, min: 1, max: 200 },  // recent messages kept in context
+  doc_size_multiplier: { type: Number, default: 1, min: 1, max: 10 },  // document upload allowance vs baseline
+  burst_multiplier:    { type: Number, default: 1, min: 1, max: 10 },  // short-burst rate limit multiplier
+  // Feature flags (§27) — future capabilities ship by adding a flag
+  features: {
+    chatAccess:          { type: Boolean, default: true },
+    voiceAccess:         { type: Boolean, default: true },
+    imageGeneration:     { type: Boolean, default: true },
+    documentAnalysis:    { type: Boolean, default: true },
+    advancedContext:     { type: Boolean, default: false },
+    agentAccess:         { type: Boolean, default: false },
+    priorityProcessing:  { type: Boolean, default: false },
+    advancedTools:       { type: Boolean, default: true },
+  },
+  is_active: { type: Boolean, default: true },
+  sort_order: { type: Number, default: 0 },
+}, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
+
+planConfigSchema.index({ sort_order: 1 });
+
+/* ── DAILY USAGE (single authoritative source for daily usage) ──
+   One document per user per day keyed by an application-timezone
+   date string (services/usage.js). Atomic $inc counters keep
+   concurrent requests from exceeding the plan limit (§36).       */
+const usageDailySchema = new Schema({
+  user_id:     { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  date:        { type: String, required: true },  // 'YYYY-MM-DD' in APP_TIMEZONE
+  chats_used:  { type: Number, default: 0, min: 0 },
+  // One-time flags so near-limit / limit notifications fire once per day
+  near_notified:   { type: Boolean, default: false },
+  reached_notified:{ type: Boolean, default: false },
+}, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
+
+usageDailySchema.index({ user_id: 1, date: 1 }, { unique: true });
+usageDailySchema.index({ date: 1, chats_used: -1 });
+
+/* ── PLAN REQUEST (manual upgrade workflow §9-§16) ───────────── */
+const planRequestSchema = new Schema({
+  user_id:       { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  full_name:     { type: String, required: true, trim: true, maxlength: 120 },
+  email:         { type: String, required: true, lowercase: true, trim: true, maxlength: 200 },
+  country:       { type: String, required: true, trim: true, maxlength: 80 },
+  country_code:  { type: String, default: null, maxlength: 8 },   // ISO-3166 alpha-2, e.g. RW
+  phone:         { type: String, required: true, trim: true, maxlength: 32 },
+  current_plan:  { type: String, required: true, enum: ['free', 'plus', 'pro'] },
+  requested_plan:{ type: String, required: true, enum: ['free', 'plus', 'pro'] },
+  message:       { type: String, default: '', maxlength: 1000 },
+  status:        { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending', index: true },
+  // Review trail
+  reviewed_at:     { type: Date, default: null },
+  reviewed_by:     { type: String, default: null },           // admin username
+  reviewed_by_id:  { type: String, default: null },           // admin id
+  rejection_reason:{ type: String, default: null, maxlength: 500 },
+  approval_notes:  { type: String, default: null, maxlength: 500 },
+  // Snapshot of the user's plan when the request was created
+  current_daily_limit: { type: Number, default: null },
+}, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
+
+planRequestSchema.index({ status: 1, created_at: -1 });
+planRequestSchema.index({ user_id: 1, status: 1 });
+planRequestSchema.index({ requested_plan: 1, created_at: -1 });
 
 /* ── FLAGGED CONTENT ──────────────────────────────────────────── */
 const flaggedContentSchema = new Schema({
@@ -286,5 +378,8 @@ module.exports = {
   KnowledgeBase:     mongoose.model('KnowledgeBase',     knowledgeBaseSchema),
   UsageTracking:     mongoose.model('UsageTracking',     usageTrackingSchema),
   UserPlan:          mongoose.model('UserPlan',          userPlanSchema),
+  PlanConfig:        mongoose.model('PlanConfig',        planConfigSchema),
+  UsageDaily:        mongoose.model('UsageDaily',        usageDailySchema),
+  PlanRequest:       mongoose.model('PlanRequest',       planRequestSchema),
   FlaggedContent:    mongoose.model('FlaggedContent',    flaggedContentSchema),
 };

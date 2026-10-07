@@ -16,7 +16,7 @@
  * push (push is prioritized, not noisy).
  */
 const { AdminNotification } = require('../models')
-const { emitToAdmins } = require('./activity')
+const { emitToAdmins, emitToUser } = require('./activity')
 const pushService = require('./push')
 
 // In-memory throttle so a burst of the same failure (e.g. provider
@@ -74,4 +74,29 @@ async function notifyAdmins(n) {
   return payload
 }
 
-module.exports = { notifyAdmins }
+/**
+ * notifyUser — realtime in-app notification for ONE user (§22).
+ * Uses the existing Socket.IO `user_<id>` room (no polling, no new
+ * infrastructure). Delivered live when the user is online; users who
+ * are offline see the durable state on next load (plan page, usage
+ * bar, modals all read /api/subscription).
+ * @param {string} userId  target user id
+ * @param {object} n { type, title, message, kind, meta }
+ *   type: info | success | warning | error
+ *   kind: semantic event, e.g. 'plan_updated', 'usage_limit_reached'
+ */
+function notifyUser(userId, n = {}) {
+  try {
+    emitToUser(userId, 'user_notification', {
+      id: `un_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      type: n.type || 'info',
+      title: n.title || '',
+      message: n.message || '',
+      kind: n.kind || null,
+      meta: n.meta || null,
+      created_at: new Date().toISOString(),
+    })
+  } catch {}
+}
+
+module.exports = { notifyAdmins, notifyUser }
