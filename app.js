@@ -774,6 +774,22 @@ function replyPrefsPrompt(body = {}, headers = {}) {
   return parts.join(' ');
 }
 
+function codeDeliveryPrompt(userText = '') {
+  const request = String(userText)
+  const asksToBuild = /\b(create|build|make|write|generate|develop|implement|code)\b/i.test(request)
+  const namesSoftware = /\b(code|coding|program|programming|html|css|javascript|typescript|react|vue|website|web app|frontend|front-end|backend|component|script|software|app|application|page|landing page)\b/i.test(request)
+  if (!asksToBuild || !namesSoftware) return ''
+
+  const singleFile = /\b(single[- ]file|one[- ]file|single html file|one html file|single file)\b/i.test(request)
+  return [
+    'Code delivery requirements: The user asked you to create or implement software. Deliver the actual complete working source code; do not answer with instructions to copy code, a description without code, or claims that files were created.',
+    singleFile
+      ? 'The user requested one file. Return exactly one complete file in one fenced code block with a descriptive filename immediately after the language, for example ```html filename=hotel-booking.html. Include all required HTML, CSS and JavaScript in that file when applicable.'
+      : 'Return every required source file in its own fenced code block. Put its relative filename immediately after the language on the opening fence, for example ```html filename=index.html or ```jsx filename=src/App.jsx. Include all code needed for the requested deliverable.',
+    'Use valid Markdown code fences and always close every fence. Keep any explanation brief and outside the code blocks. Never claim that code was executed, tested, or written to disk.'
+  ].join(' ')
+}
+
 /* ── Shared assistant turn (real Groq streaming, SSE) ────────── */
 async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = 'chat' }) {
   const abortController = new AbortController();
@@ -835,8 +851,9 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
   }
 
   const prefs = replyPrefsPrompt(req.body, req.headers);
+  const codeDelivery = codeDeliveryPrompt(userText);
   const messages = chatService.buildMessages({
-    systemPrompt: [cfg.system_prompt, prefs].filter(Boolean).join('\n\n'), memory, ragContext,
+    systemPrompt: [cfg.system_prompt, prefs, codeDelivery].filter(Boolean).join('\n\n'), memory, ragContext,
     history: kept, summary, documentContext,
     userText,
     imageDataUrl,
@@ -850,7 +867,8 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
   let usageTokens = null;
   const stream = await provider.chatCompleteStream({
     messages, model,
-    maxTokens: cfg.max_tokens, temperature: cfg.temperature,
+    maxTokens: codeDelivery ? Math.max(Number(cfg.max_tokens) || 2048, 8192) : cfg.max_tokens,
+    temperature: cfg.temperature,
     signal: abortController.signal,
   });
 
