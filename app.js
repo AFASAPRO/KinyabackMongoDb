@@ -61,28 +61,36 @@ async function connectDB() {
 }
 
 /* ── CORS ──────────────────────────────────────────────────────── */
-const allowedOrigins = [
-  "https://kinyabotai.vercel.app",
-  "http://localhost:5173",
-  "http://localhost:3000",
-  "http://localhost:4173"
-];
+// Canonical production site: https://kinyabotai.online (www is also valid).
+// Extra origins can be added WITHOUT code changes via FRONTEND_URL and/or a
+// comma-separated ALLOWED_ORIGINS env var (e.g. a staging site). No wildcard:
+// every origin must be listed explicitly because credentials are enabled.
+const normalizeOrigin = (o) => String(o || '').trim().replace(/\/+$/, '');
+const allowedOrigins = [...new Set([
+  'https://kinyabotai.online',
+  'https://www.kinyabotai.online',
+  // local development
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'http://localhost:4173',
+  'http://127.0.0.1:5173',
+  normalizeOrigin(process.env.FRONTEND_URL),
+  ...String(process.env.ALLOWED_ORIGINS || '').split(',').map(normalizeOrigin)
+].filter(Boolean))];
 
-app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin) return callback(null, true);
+// One origin check shared by Express (REST) and Socket.IO (realtime).
+function corsOrigin(origin, callback) {
+  // No Origin header = same-origin / server-to-server / curl: allow (as before)
+  if (!origin) return callback(null, true);
+  if (allowedOrigins.includes(normalizeOrigin(origin))) return callback(null, true);
+  return callback(new Error('Not allowed by CORS'));
+}
+const corsOptions = { origin: corsOrigin, credentials: true };
 
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    } else {
-      return callback(new Error("Not allowed by CORS"));
-    }
-  },
-  credentials: true
-}));
+app.use(cors(corsOptions));
 
-// ✅ THIS LINE FIXES YOUR ERROR
-app.options("*", cors());
+// Preflight (OPTIONS) uses the SAME restricted policy — never a wildcard.
+app.options('*', cors(corsOptions));
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
@@ -211,7 +219,9 @@ async function sendVerifyEmail(to, username, otp) {
   } catch (e) { console.error('[Email]', e.message); return false; }
 }
 async function sendInviteEmail(to, inviterName, workspaceName) {
-  const link = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/register?invited_by=${encodeURIComponent(inviterName)}`;
+  // The chat SPA is mounted under /chat/ (vite base) — the domain root serves the landing page.
+  const siteUrl = normalizeOrigin(process.env.FRONTEND_URL) || 'https://kinyabotai.online';
+  const link = `${siteUrl}/chat/register?invited_by=${encodeURIComponent(inviterName)}`;
   try {
     await mailer.sendMail({
       from: process.env.SMTP_FROM || 'KinyaBot AI <noreply@kinyabot.ai>', to,
@@ -2270,7 +2280,7 @@ app.get('/api/health', (_, res) => res.json({ status: 'ok', version: require('./
 const http = require('http');
 const { Server } = require('socket.io');
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: true, credentials: true } });
+const io = new Server(server, { cors: { origin: corsOrigin, credentials: true } });
 app.set('io', io);
 attachIo(io); // services/activity.js emits live events through this
 
