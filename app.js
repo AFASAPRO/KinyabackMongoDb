@@ -14,7 +14,6 @@ const fs         = require('fs');
 const path       = require('path');
 const crypto     = require('crypto');
 const nodemailer = require('nodemailer');
-const admin      = require('firebase-admin');
 const { complete: completeWithGroq, DEFAULT_MODEL } = require('./ai-service');
 const aiConfig        = require('./services/ai/config');
 const provider        = require('./services/ai/groqProvider');
@@ -36,11 +35,6 @@ const {
   SystemLog, UserMemory, KnowledgeBase, UsageTracking,
   UserPlan, FlaggedContent, SecurityEvent, SearchLog
 } = require('./models');
-
-// Firebase Admin init
-if (!admin.apps.length) {
-  admin.initializeApp({ projectId: process.env.FIREBASE_PROJECT_ID || 'kinyabot-92ad1' });
-}
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
@@ -801,37 +795,17 @@ app.post('/api/auth/login', async (req, res) => {
   } catch (err) { console.error('[Login]', err); res.status(500).json({ error: 'Login failed. Please try again.' }); }
 });
 
-app.post('/api/auth/google', async (req, res) => {
-  const { idToken } = req.body;
-  if (!idToken) return res.status(400).json({ error: 'ID Token required' });
-  try {
-    const decodedToken = await admin.auth().verifyIdToken(idToken);
-    const { email, name, picture, uid, email_verified } = decodedToken;
-    let user = await User.findOne({ email: email.toLowerCase() });
-    if (!user) {
-      const randomPass = crypto.randomBytes(16).toString('hex');
-      const hash = await bcrypt.hash(randomPass, 12);
-      let username = name || email.split('@')[0];
-      const existingUser = await User.findOne({ username });
-      if (existingUser) username = `${username}_${uid.slice(0, 5)}`;
-      user = await User.create({ username, email: email.toLowerCase(), password_hash: hash, avatar_url: picture || null, email_verified: email_verified === true });
-      await sysLog('info', 'auth', `Registered via Google: ${username}`, null, user._id);
-      logActivity('register', { username, user_id: user._id.toString() });
-    } else {
-      if (user.is_banned) return res.status(403).json({ error: 'Account suspended.' });
-      user.last_login = new Date();
-      if (picture) user.avatar_url = picture;
-      if (email_verified === true) user.email_verified = true;
-      await user.save();
-      logActivity('login', { username: user.username, user_id: user._id.toString() });
-    }
-    const token = jwt.sign({ id: user._id.toString(), username: user.username, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ token, user: { id: user._id.toString(), username: user.username, email: user.email, avatar_url: user.avatar_url, onboarded: user.onboarded, profession: user.profession, email_verified: user.email_verified } });
-  } catch (err) {
-    console.error('[Google Auth]', err);
-    res.status(401).json({ error: 'Google authentication failed. Please try again.' });
-  }
-});
+/* Google sign-in — official OAuth 2.0 / OIDC authorization-code flow
+   (replaces the former Firebase popup). See routes/googleAuth.js.
+     GET  /api/auth/google            → redirect to Google
+     GET  /api/auth/google/callback   → Google redirects back here
+     POST /api/auth/google/exchange   → SPA swaps one-time code for the KinyaBot JWT */
+app.use('/api/auth/google', require('./routes/googleAuth')({
+  User, UserPlan, jwt, JWT_SECRET, bcrypt,
+  allowedOrigins, normalizeOrigin,
+  isMaintenance: () => !!cfg.maintenance_mode,
+  sysLog, logActivity
+}));
 
 app.get('/api/auth/me', authGuard, async (req, res) => {
   try {

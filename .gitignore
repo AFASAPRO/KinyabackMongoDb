@@ -1,3 +1,8 @@
+# Never commit secrets
 .env
-uploads/
+**/.env
+client_secret*.json
+*.apps.googleusercontent.com.json
 node_modules/
+dist/
+uploads/

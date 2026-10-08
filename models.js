@@ -26,9 +26,13 @@ const userSchema = new Schema({
   reset_token_expires: { type: Date, default: null },
   is_banned:       { type: Boolean, default: false },
   last_login:      { type: Date,   default: null },
+  // Google OAuth subject ("sub") — set when a Google identity is linked to this account
+  google_id:       { type: String, default: undefined },
 }, { timestamps: { createdAt: 'created_at', updatedAt: false } });
 
 userSchema.index({ reset_token: 1 });
+// Unique only for accounts that actually have a Google identity (many users have none)
+userSchema.index({ google_id: 1 }, { unique: true, partialFilterExpression: { google_id: { $type: 'string' } } });
 // Superadmin filters / analytics (username & email are already indexed
 // via unique: true — no duplicate declarations here)
 userSchema.index({ created_at: -1 });
