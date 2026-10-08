@@ -22,10 +22,12 @@ const CHARS_PER_TOKEN = 4
 
 /* ── Load + bound history ────────────────────────────────────── */
 /* maxRows lets callers widen the fetched window per plan (higher
-   plans keep more conversation context — services/plans.js). */
+   plans keep more conversation context — services/plans.js).
+   Superseded messages (edit/regenerate branches, §18) never enter
+   the model context. */
 async function loadHistory(chatId, { excludeMessageId = null, maxRows = null } = {}) {
   const fetchLimit = Math.max(Number(maxRows) || 0, config.context.maxMessages, config.context.summarizeAfter) + 4
-  const rows = await Message.find({ chat_id: chatId })
+  const rows = await Message.find({ chat_id: chatId, superseded: { $ne: true } })
     .sort({ created_at: -1, _id: -1 })
     .limit(fetchLimit)
     .lean()
@@ -126,7 +128,7 @@ function messageText(m) {
 }
 
 /* ── Prompt assembly ─────────────────────────────────────────── */
-function buildMessages({ systemPrompt, memory, ragContext, history, summary, documentContext, userText, imageDataUrl, priorImage }) {
+function buildMessages({ systemPrompt, memory, ragContext, history, summary, documentContext, userText, imageDataUrl, imageDataUrls, priorImage }) {
   const contextBlocks = []
   if (memory && Object.keys(memory).length) {
     contextBlocks.push(`User context: ${Object.entries(memory).map(([k, v]) => `${k}=${v}`).join(', ')}`)
@@ -154,19 +156,27 @@ function buildMessages({ systemPrompt, memory, ragContext, history, summary, doc
     messages.push({ role: m.role, content: text })
   }
 
-  // Final user turn. Three shapes:
-  //   1. new image this turn → multimodal parts (text + image)
+  // All images attached THIS turn (§8, multi-image). One multimodal
+  // user turn carries the text + every image part, routed to the
+  // vision-capable model by pickModel().
+  const images = [
+    ...(Array.isArray(imageDataUrls) ? imageDataUrls : []),
+    ...(imageDataUrl ? [imageDataUrl] : []), // legacy single-image callers
+  ].filter(Boolean)
+
+  // Final user turn. Shapes:
+  //   1. new image(s) this turn → multimodal parts (text + images)
   //   2. follow-up about an earlier image → re-attach it (§18)
   //   3. plain text (attachment-only turns get a default prompt so a
   //      user turn ALWAYS exists — prevents greeting prefills)
   const trimmedUserText = (userText || '').trim()
-  if (imageDataUrl) {
+  if (images.length) {
     while (messages.length && messages[messages.length - 1].role === 'user') messages.pop()
     messages.push({
       role: 'user',
       content: [
         { type: 'text', text: trimmedUserText || 'What is in this image? Describe it in detail.' },
-        { type: 'image_url', image_url: { url: imageDataUrl } },
+        ...images.map(url => ({ type: 'image_url', image_url: { url } })),
       ],
     })
   } else if (priorImage?.dataUrl) {
@@ -203,9 +213,20 @@ function buildMessages({ systemPrompt, memory, ragContext, history, summary, doc
 
 /* Choose the model for this turn (§4): vision whenever the model can
    actually see an image (new or re-attached), otherwise chat model. */
-function pickModel({ imageDataUrl, priorImage } = {}) {
-  if (imageDataUrl || priorImage?.dataUrl) return config.models.vision
+function pickModel({ imageDataUrl, imageDataUrls, priorImage } = {}) {
+  if (imageDataUrl || (Array.isArray(imageDataUrls) && imageDataUrls.length) || priorImage?.dataUrl) return config.models.vision
   return config.models.chat
+}
+
+/* Known vision-capable fallbacks (§7). If the configured vision model
+   rejects an image request (text-only override, retired model id),
+   the caller retries with one of these instead of failing the turn. */
+const VISION_FALLBACK_MODELS = [
+  'meta-llama/llama-4-scout-17b-16e-instruct',
+  'meta-llama/llama-4-maverick-17b-128e-instruct',
+]
+function visionFallbackModel(primaryModel) {
+  return VISION_FALLBACK_MODELS.find(m => m && m !== primaryModel) || null
 }
 
 module.exports = {
@@ -217,5 +238,7 @@ module.exports = {
   messageText,
   buildMessages,
   pickModel,
+  visionFallbackModel,
+  VISION_FALLBACK_MODELS,
   CHARS_PER_TOKEN,
 }

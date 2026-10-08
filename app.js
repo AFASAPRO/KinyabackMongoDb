@@ -106,13 +106,18 @@ const upload = multer({
 // NOTE: public static serving of ./uploads was REMOVED for privacy (§19).
 // Attachments are now served exclusively through the authenticated,
 // ownership-checked GET /api/files/:name endpoint (see CHAT ROUTES).
-const CHAT_FILE_FILTER = /\.(jpg|jpeg|png|gif|webp|pdf|txt|md|csv|json|docx|py|js|ts|html|css|xml|yaml|yml|mp3|wav|m4a|ogg|webm|flac|aac|mp4)$/i;
+// Upload TYPE validation happens in buildMessageAttachments() (with
+// magic-byte checks) — NOT in the multer filter — so unsupported files
+// get a friendly 400 naming the file instead of being silently dropped.
 // Hard cap covers the largest plan document allowance (Pro = 4× base);
 // per-plan limits are enforced inside the route handlers (§27).
 const CHAT_UPLOAD_MAX_BYTES = Math.max(
   aiConfig.limits.imageSizeBytes,
   aiConfig.limits.documentSizeBytes * 4
 );
+// Max attachments per message — reliable multi-upload without
+// destabilizing request sizes (§13).
+const CHAT_MAX_FILES = 4;
 const uploadChat = multer({
   storage: multer.diskStorage({
     destination(_, __, cb) {
@@ -124,9 +129,23 @@ const uploadChat = multer({
       cb(null, `c_${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`);
     }
   }),
-  limits: { fileSize: CHAT_UPLOAD_MAX_BYTES },
-  fileFilter(_, file, cb) { cb(null, CHAT_FILE_FILTER.test(file.originalname)); }
+  limits: { fileSize: CHAT_UPLOAD_MAX_BYTES, files: CHAT_MAX_FILES },
+  /* Broad accept at the multer layer: a rejected file must reach the
+     app's validator so the caller gets a FRIENDLY 400 naming the file
+     — a silent multer skip would turn "bad file" into a plain text
+     message and the user would never know the attachment was lost.
+     Size and count are still capped here; classification, magic-byte
+     checks and per-plan limits run in buildMessageAttachments.     */
+  fileFilter(_, file, cb) { cb(null, true); }
 });
+/* Accept BOTH attachment conventions: `files[]` / `files` (new,
+   multiple) and `file` (legacy single). Normalized downstream by
+   normalizeUploadedFiles() so handlers only ever see one array. */
+const uploadChatFields = uploadChat.fields([
+  { name: 'files', maxCount: CHAT_MAX_FILES },
+  { name: 'files[]', maxCount: CHAT_MAX_FILES },
+  { name: 'file', maxCount: 1 },
+]);
 const uploadAudio = multer({
   storage: multer.diskStorage({
     destination(_, __, cb) {
@@ -245,6 +264,8 @@ function friendlyError(err) {
     return 'KinyaBot is busy right now. Please wait a moment and try again.';
   if (err?.code === 'INVALID_CONVERSATION' || err?.code === 'EMPTY_AI_RESPONSE')
     return 'KinyaBot could not process that conversation. Please try again.';
+  if (err?.code === 'CONVERSATION_NOT_FOUND')
+    return 'This conversation could not be loaded. It may have been deleted or you may not have permission to access it.';
   if (msg.includes('ENOTFOUND') || msg.includes('getaddrinfo') || msg.includes('ECONNREFUSED'))
     return "Couldn't reach the AI service. Please check your internet connection and try again.";
   if (msg.includes('timeout') || msg.includes('ETIMEDOUT'))
@@ -479,6 +500,59 @@ function fmtMessage(doc) {
   return obj;
 }
 function fmtMessageArr(docs) { return docs.map(fmtMessage); }
+
+/* ── CONVERSATION ID (public URL identifier) ───────────────────
+   UUID v4 via crypto.randomUUID (crypto is required at the top) —
+   collision-resistant, not sequential, never exposes Mongo
+   ObjectIds in URLs (§1/§2).                                     */
+function newConversationId() { return crypto.randomUUID(); }
+
+/* Resolve `:id` as EITHER a public conversation_id (UUID) or a Mongo
+   ObjectId, ALWAYS scoped to the authenticated owner (§5). Attaches
+   the verified chat document to req.chatDoc. */
+async function resolveChatParam(req, res) {
+  const raw = String(req.params.id || '').trim();
+  if (!raw) {
+    res.status(404).json({ error: 'Conversation not found', code: 'CONVERSATION_NOT_FOUND' });
+    return null;
+  }
+  const isObjectId = /^[a-f\d]{24}$/i.test(raw);
+  const query = isObjectId
+    ? { _id: raw, user_id: req.user.id }
+    : { conversation_id: raw, user_id: req.user.id };
+  const chat = await Chat.findOne(query);
+  if (!chat) {
+    res.status(404).json({
+      error: 'This conversation could not be loaded. It may have been deleted or you may not have permission to access it.',
+      code: 'CONVERSATION_NOT_FOUND',
+    });
+    return null;
+  }
+  return chat;
+}
+
+/* Normalize multer output (fields map from .fields()) into ONE flat
+   array of uploaded files, preserving submission order. Accepts the
+   legacy single `file` field too. */
+function normalizeUploadedFiles(req) {
+  if (!req.files) {
+    // Legacy .single('file') uploads expose req.file
+    return req.file ? [req.file] : [];
+  }
+  if (Array.isArray(req.files)) return req.files; // .array('files')
+  const groups = ['files[]', 'files', 'file'];
+  const out = [];
+  for (const g of groups) {
+    if (Array.isArray(req.files[g])) out.push(...req.files[g]);
+  }
+  return out;
+}
+
+/* HTTP status for a failed request: coded userSafe errors carry a
+   friendly message and deserve 4xx — never a scary 500 (§24).     */
+function httpErrorStatus(err) {
+  return err?.status || (err?.userSafe ? 400 : 500);
+}
 
 /* ══════════════════════════════════════════════════════════════
    USER AUTH
@@ -733,19 +807,41 @@ app.post('/api/track', async (req, res) => {
 ══════════════════════════════════════════════════════════════ */
 app.get('/api/chats', authGuard, async (req, res) => {
   try {
+    // Two indexed queries total (sidebar perf, §33) — no per-chat N+1.
     const chats = await Chat.find({ user_id: req.user.id }).sort({ updated_at: -1 }).lean();
-    const enriched = await Promise.all(chats.map(async c => {
-      const lastMsg = await Message.findOne({ chat_id: c._id }).sort({ created_at: -1 }).select('content').lean();
-      const msgCount = await Message.countDocuments({ chat_id: c._id });
-      return { ...c, id: c._id.toString(), _id: undefined, user_id: c.user_id.toString(), last_message: lastMsg?.content || null, message_count: msgCount };
-    }));
-    res.json(enriched);
+    const ids = chats.map(c => c._id);
+    const stats = ids.length ? await Message.aggregate([
+      { $match: { chat_id: { $in: ids }, superseded: { $ne: true } } },
+      { $sort: { created_at: -1, _id: -1 } },
+      { $group: { _id: '$chat_id', last: { $first: '$content' }, count: { $sum: 1 } } },
+    ]) : [];
+    const byChat = new Map(stats.map(s => [String(s._id), s]));
+    res.json(chats.map(c => ({
+      id: c._id.toString(),
+      conversation_id: c.conversation_id || null,
+      title: c.title,
+      is_pinned: !!c.is_pinned,
+      mode: c.mode || 'chat',
+      model: c.model || null,
+      created_at: c.created_at,
+      updated_at: c.updated_at,
+      last_message: byChat.get(String(c._id))?.last || null,
+      message_count: byChat.get(String(c._id))?.count || 0,
+    })));
   } catch { res.status(500).json({ error: 'Could not load chats' }); }
 });
 
+/* Explicit empty-conversation creation — kept for API compatibility.
+   The main UI never calls this: conversations are created lazily with
+   the first message (POST /api/chats/messages/stream, §3).           */
 app.post('/api/chats', authGuard, async (req, res) => {
   try {
-    const chat = await Chat.create({ user_id: req.user.id, title: (req.body.title || 'New Chat').slice(0, 255) });
+    const chat = await Chat.create({
+      user_id: req.user.id,
+      title: (req.body.title || 'New Chat').slice(0, 255),
+      conversation_id: newConversationId(),
+      mode: ['chat', 'agent'].includes(req.body.mode) ? req.body.mode : 'chat',
+    });
     logActivity('new_chat', { username: req.user.username, user_id: req.user.id, meta: { chatId: chat._id.toString() } });
     res.status(201).json(fmt(chat));
   } catch { res.status(500).json({ error: 'Could not create chat' }); }
@@ -753,31 +849,38 @@ app.post('/api/chats', authGuard, async (req, res) => {
 
 app.get('/api/chats/:id', authGuard, async (req, res) => {
   try {
-    const chat = await Chat.findOne({ _id: req.params.id, user_id: req.user.id }).lean();
-    if (!chat) return res.status(404).json({ error: 'Chat not found' });
-    const messages = await Message.find({ chat_id: req.params.id }).sort({ created_at: 1 }).lean();
-    res.json({ ...chat, id: chat._id.toString(), _id: undefined, messages: fmtMessageArr(messages) });
+    const chat = await resolveChatParam(req, res);
+    if (!chat) return;
+    // Superseded messages stay in the database but never load into the
+    // active conversation view (§18 branching).
+    const messages = await Message.find({ chat_id: chat._id, superseded: { $ne: true } }).sort({ created_at: 1, _id: 1 }).lean();
+    const obj = fmt(chat);
+    obj.messages = fmtMessageArr(messages);
+    res.json(obj);
   } catch { res.status(500).json({ error: 'Could not load chat' }); }
 });
 
 app.put('/api/chats/:id', authGuard, async (req, res) => {
-  const { title, is_pinned } = req.body;
+  const { title, is_pinned, mode } = req.body;
   const update = {};
   if (title !== undefined)     update.title = title;
   if (is_pinned !== undefined) update.is_pinned = is_pinned;
+  if (['chat', 'agent'].includes(mode)) update.mode = mode;
   if (!Object.keys(update).length) return res.status(400).json({ error: 'Nothing to update' });
   try {
-    await Chat.findOneAndUpdate({ _id: req.params.id, user_id: req.user.id }, update);
+    const chat = await resolveChatParam(req, res);
+    if (!chat) return;
+    await Chat.updateOne({ _id: chat._id }, update);
     res.json({ success: true });
   } catch { res.status(500).json({ error: 'Could not update chat' }); }
 });
 
 app.delete('/api/chats/:id', authGuard, async (req, res) => {
   try {
-    const chat = await Chat.findOne({ _id: req.params.id, user_id: req.user.id });
-    if (!chat) return res.status(404).json({ error: 'Chat not found' });
-    await Message.deleteMany({ chat_id: req.params.id });
-    await Chat.deleteOne({ _id: req.params.id });
+    const chat = await resolveChatParam(req, res);
+    if (!chat) return;
+    await Message.deleteMany({ chat_id: chat._id });
+    await Chat.deleteOne({ _id: chat._id });
     res.json({ success: true });
   } catch { res.status(500).json({ error: 'Could not delete chat' }); }
 });
@@ -857,8 +960,21 @@ function codeDeliveryPrompt(userText = '') {
   ].join(' ')
 }
 
-/* ── Shared assistant turn (real Groq streaming, SSE) ────────── */
-async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = 'chat', reservation = null, planCfg = null }) {
+/* ── Shared assistant turn (real Groq streaming, SSE) ──────────
+   opts:
+     chat         — owning Chat document (freshened + saved)
+     send         — SSE writer
+     startedAt    — perf clock
+     trackType    — UsageTracking request_type
+     reservation  — daily-usage reservation (refunded on failure)
+     planCfg      — plan configuration (context budget)
+     carrier      — EXISTING assistant message being regenerated.
+                    When set, the new answer is appended to the
+                    carrier's `versions` history instead of creating
+                    a new document (§19/§20).
+     excludeMessageId — message to leave out of the context window
+                    (the carrier itself while it is being replaced). */
+async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = 'chat', reservation = null, planCfg = null, carrier = null, excludeMessageId = null }) {
   const abortController = new AbortController();
   let clientClosed = false;
   req.on('close', () => { clientClosed = true; try { abortController.abort(new Error('client closed')); } catch {} });
@@ -870,33 +986,35 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
   // Higher plans keep more recent messages in context (advancedContext).
   const planContextMult = planCfg?.contextMessages ? Math.min(8, Math.max(1, planCfg.contextMessages / 10)) : 1;
   const planBudgetTokens = Math.round(aiConfig.context.tokenBudget * planContextMult);
-  const fullHistory = await chatService.loadHistory(chatId, { maxRows: planCfg?.contextMessages || null });
+  const fullHistory = await chatService.loadHistory(chatId, { maxRows: planCfg?.contextMessages || null, excludeMessageId });
   const { kept, droppedCount } = chatService.trimToBudget(fullHistory, planBudgetTokens);
   const summary = await chatService.ensureSummary(chat, kept, droppedCount);
   const ragContext = cfg.knowledge_base_enabled ? await searchKnowledgeBase(kept[kept.length - 1]?.content || '') : '';
   const documentContext = chatService.findRecentDocumentContext(kept);
 
-  // Multimodal: image attached to the most recent user turn (§8),
-  // or re-attached from earlier in the conversation for follow-ups (§18)
+  // Multimodal: ALL images attached to the most recent user turn (§8),
+  // re-attached from earlier in the conversation for follow-ups (§18)
   const lastUser = [...kept].reverse().find(m => m.role === 'user');
-  const imgAtt = lastUser?.attachments?.find(a => a.kind === 'image');
-  let imageDataUrl = null;
-  if (imgAtt) {
-    try {
-      const imgPath = imgAtt.url.replace('/uploads', './uploads');
-      const b64 = fs.readFileSync(imgPath).toString('base64');
-      imageDataUrl = `data:${imgAtt.mime || 'image/jpeg'};base64,${b64}`;
-    } catch (e) {
-      console.error('[Stream] image load failed:', e.message);
-      send('error', { message: 'KinyaBot could not open the attached image. Please re-attach it and try again.' });
-      return res.end();
+  const imageAtts = (lastUser?.attachments || []).filter(a => a.kind === 'image');
+  const imageDataUrls = [];
+  if (imageAtts.length) {
+    for (const att of imageAtts) {
+      try {
+        const imgPath = att.url.replace('/uploads', './uploads');
+        const b64 = fs.readFileSync(imgPath).toString('base64');
+        imageDataUrls.push(`data:${att.mime || 'image/jpeg'};base64,${b64}`);
+      } catch (e) {
+        console.error('[Stream] image load failed:', e.message);
+        send('error', { message: 'KinyaBot could not open the attached image. Please re-attach it and try again.' });
+        return res.end();
+      }
     }
   }
 
   // Follow-up about an earlier image: re-attach the most recent one so
   // the model can see it instead of inventing an answer (§18).
   let priorImage = null;
-  if (!imageDataUrl) {
+  if (!imageDataUrls.length) {
     const priorAtt = chatService.findRecentImageContext(kept);
     if (priorAtt) {
       try {
@@ -914,7 +1032,7 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
   // Attachment-only turns must still carry a user request, otherwise the
   // model receives a transcript with no trailing user message.
   let userText = lastUser?.content || '';
-  if (!userText.trim() && !imageDataUrl && !priorImage) {
+  if (!userText.trim() && !imageDataUrls.length && !priorImage) {
     const att = lastUser?.attachments?.[0];
     if (att?.kind === 'document') userText = 'Please read the attached document and tell me what it contains.';
     else if (att) userText = 'Please tell me about the file I attached.';
@@ -926,28 +1044,59 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
     systemPrompt: [cfg.system_prompt, prefs, codeDelivery].filter(Boolean).join('\n\n'), memory, ragContext,
     history: kept, summary, documentContext,
     userText,
-    imageDataUrl,
+    imageDataUrls,
     priorImage,
   });
-  const model = chatService.pickModel({ imageDataUrl, priorImage });
+  const hasImages = imageDataUrls.length > 0 || !!priorImage;
+  const primaryModel = chatService.pickModel({ imageDataUrl: imageDataUrls[0], priorImage });
 
   send('start', { streaming: true });
 
   let aiText = '';
   let usageTokens = null;
-  try {
+  let usedModel = primaryModel;
+
+  /* Run one streaming attempt against a specific model. */
+  async function streamOnce(model) {
     const stream = await provider.chatCompleteStream({
       messages, model,
       maxTokens: codeDelivery ? Math.max(Number(cfg.max_tokens) || 2048, 8192) : cfg.max_tokens,
       temperature: cfg.temperature,
       signal: abortController.signal,
     });
-
+    let text = '';
+    let tokens = null;
     for await (const chunk of stream) {
       const delta = chunk.choices?.[0]?.delta?.content || '';
-      if (chunk.usage?.total_tokens) usageTokens = chunk.usage.total_tokens;
-      if (delta) { aiText += delta; send('chunk', { text: delta }); }
+      if (chunk.usage?.total_tokens) tokens = chunk.usage.total_tokens;
+      if (delta) { text += delta; send('chunk', { text: delta }); }
       if (clientClosed) break;
+    }
+    return { text, tokens };
+  }
+
+  try {
+    try {
+      const r = await streamOnce(primaryModel);
+      aiText = r.text; usageTokens = r.tokens;
+    } catch (err) {
+      /* Vision robustness (§6/§7): when an image WAS attached and the
+         configured model rejects the request (text-only model, retired
+         model id, unsupported media part), retry once with the known
+         vision-capable fallback before surfacing an error. The user
+         must never be told the image "was not attached" because of a
+         model configuration problem.                                  */
+      const retryable = hasImages && !clientClosed && !aiText &&
+        (err?.status === 400 || err?.status === 404 || err?.code === 'AI_MODEL_UNAVAILABLE' ||
+         err?.code === 'AI_PROVIDER_ERROR');
+      const fallbackModel = chatService.visionFallbackModel(primaryModel);
+      if (retryable && fallbackModel) {
+        console.warn(`[Stream] vision retry: "${primaryModel}" rejected the image request (${err?.code || err?.status}), retrying with "${fallbackModel}"`);
+        const r = await streamOnce(fallbackModel);
+        aiText = r.text; usageTokens = r.tokens; usedModel = fallbackModel;
+      } else {
+        throw err;
+      }
     }
   } catch (err) {
     if (!clientClosed) {
@@ -961,11 +1110,7 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
   // Client cancelled mid-generation → keep the partial answer honestly (§17)
   if (clientClosed) {
     if (aiText.trim()) {
-      await Message.create({
-        chat_id: chatId, role: 'assistant', content: aiText,
-        model, provider: aiConfig.provider, tokens: usageTokens,
-        processing_ms: Date.now() - startedAt, status: 'cancelled',
-      });
+      await saveAssistantResult({ carrier, chatId, content: aiText, model: usedModel, tokens: usageTokens, processingMs: Date.now() - startedAt, status: 'cancelled' });
     }
     return;
   }
@@ -976,16 +1121,16 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
   }
 
   // Source references ONLY when the backend actually knows them (§7)
-  const sources = (!imageDataUrl && documentContext)
+  const sources = (!imageDataUrls.length && documentContext)
     ? [`${documentContext.name}${documentContext.pages ? ` (${documentContext.pages} pages)` : ''}`]
     : [];
 
-  const aiMsg = await Message.create({
-    chat_id: chatId, role: 'assistant', content: aiText,
-    model, provider: aiConfig.provider, tokens: usageTokens,
-    processing_ms: Date.now() - startedAt, status: 'completed', sources,
+  const aiMsg = await saveAssistantResult({
+    carrier, chatId, content: aiText, model: usedModel, tokens: usageTokens,
+    processingMs: Date.now() - startedAt, status: 'completed', sources, provider: aiConfig.provider,
   });
   chat.updated_at = new Date();
+  chat.model = usedModel; // conversation remembers the model for restoration (§31)
   await chat.save();
   if (reservation) reservation.completed = true; // AI turn fully served
 
@@ -1011,194 +1156,411 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
   res.end();
 }
 
-/* Validate + prepare a chat attachment (server-side truth, §19) */
-function prepareAttachment(req) {
-  if (!req.file) return { meta: null, imageDataUrl: null, documentExtract: null, messageType: 'text' };
-  const kind = documentService.classify(req.file.originalname, req.file.mimetype);
-  if (kind === 'unknown')
-    throw documentService.coded('UNSUPPORTED_FILE', 'That file type is not supported. Attach an image, PDF, DOCX, TXT or code file.');
-
-  const valid = documentService.validateUpload(req.file.path, kind === 'image' ? 'image' : kind, req.file.originalname);
-  const url = `/uploads/${req.file.filename}`;
-  const baseMeta = { kind, url, name: req.file.originalname, mime: req.file.mimetype, size: valid.size };
-
-  if (kind === 'image') {
-    const b64 = fs.readFileSync(req.file.path).toString('base64');
-    return { meta: baseMeta, imageDataUrl: `data:${req.file.mimetype};base64,${b64}`, documentExtract: null, messageType: 'image' };
+/* Persist an assistant generation.
+   With a carrier (regeneration): append the previous active answer to
+   `versions`, then make the new answer active — nothing is destroyed
+   and the user can navigate between generations (§20).
+   Without one: create a fresh message whose `versions` starts with
+   this first generation. `content` ALWAYS mirrors the active version
+   so context building keeps working unchanged.                     */
+const MAX_RESPONSE_VERSIONS = 10;
+async function saveAssistantResult({ carrier, chatId, content, model, tokens, processingMs, status = 'completed', sources = [], provider = null }) {
+  const version = {
+    content, model: model || null, tokens: tokens ?? null,
+    created_at: new Date(), processing_ms: processingMs, status,
+  };
+  if (carrier) {
+    const versions = Array.isArray(carrier.versions) ? carrier.versions.filter(v => (v.content || '').trim()) : [];
+    if (!versions.length) {
+      versions.push({
+        content: carrier.content || '', model: carrier.model || null, tokens: carrier.tokens ?? null,
+        created_at: carrier.created_at || new Date(), processing_ms: carrier.processing_ms ?? null,
+        status: carrier.status === 'cancelled' ? 'cancelled' : 'completed',
+      });
+    }
+    versions.push(version);
+    carrier.versions = versions.slice(-MAX_RESPONSE_VERSIONS);
+    carrier.active_version = carrier.versions.length - 1;
+    carrier.content = content;
+    carrier.model = version.model;
+    carrier.tokens = version.tokens;
+    carrier.processing_ms = processingMs;
+    carrier.status = status;
+    carrier.created_at = new Date();
+    await carrier.save();
+    return carrier;
   }
-  if (kind === 'document') {
-    return { meta: baseMeta, imageDataUrl: null, documentExtract: null, messageType: 'document', needsExtract: true };
-  }
-  throw documentService.coded('UNSUPPORTED_FILE', 'That file type cannot be used in chat.');
+  return Message.create({
+    chat_id: chatId, role: 'assistant', content,
+    model: version.model, provider, tokens: version.tokens,
+    processing_ms: processingMs, status, sources,
+    versions: [version], active_version: 0,
+  });
 }
 
-/* ── SEND MESSAGE (SSE Streaming, multimodal) ────────────────── */
-app.post('/api/chats/:id/messages/stream', authGuard, uploadChat.single('file'), async (req, res) => {
-  const { content } = req.body;
-  const chatId = req.params.id;
-  if (!content && !req.file) return res.status(400).json({ error: 'Message or file required' });
+/* Validate + prepare chat attachments (server-side truth, §19).
+   Handles MULTIPLE files per message (§13): every file is classified,
+   magic-byte validated and turned into a structured attachment meta.
+   Images additionally produce base64 data URLs for the vision model.
+   Throws user-safe coded errors naming the offending file.        */
+function prepareAttachments(req) {
+  const files = normalizeUploadedFiles(req);
+  if (!files.length) {
+    return { metas: [], imageDataUrls: [], messageType: 'text' };
+  }
 
-  // Plan context first (one indexed read; config cached) — drives the
-  // burst limits, upload allowances and context budget for this turn.
+  const metas = [];
+  const imageDataUrls = [];
+  let hasImage = false, hasDocument = false;
+
+  for (const file of files) {
+    const kind = documentService.classify(file.originalname, file.mimetype);
+    if (kind === 'unknown')
+      throw documentService.coded('UNSUPPORTED_FILE', `"${file.originalname}" is not a supported file type. Attach images, PDF, DOCX, TXT, CSV, JSON or code files.`);
+    if (kind === 'audio')
+      throw documentService.coded('UNSUPPORTED_FILE', `"${file.originalname}" is an audio file — voice messages are handled by the voice input feature, not chat attachments.`);
+
+    const valid = documentService.validateUpload(file.path, kind, file.originalname);
+    const url = `/uploads/${file.filename}`;
+    const meta = { kind, url, name: file.originalname, mime: file.mimetype, size: valid.size };
+
+    if (kind === 'image') {
+      const b64 = fs.readFileSync(file.path).toString('base64');
+      imageDataUrls.push(`data:${file.mimetype};base64,${b64}`);
+      hasImage = true;
+    } else {
+      hasDocument = true;
+    }
+    metas.push(meta);
+  }
+
+  return {
+    metas,
+    imageDataUrls,
+    messageType: hasImage ? 'image' : (hasDocument ? 'document' : 'text'),
+  };
+}
+
+/* Clean up multer temp files (best-effort) when a request bails out
+   before the attachments became part of a saved message. */
+function cleanupUploads(req) {
+  for (const f of normalizeUploadedFiles(req)) {
+    try { if (f?.path && fs.existsSync(f.path)) fs.unlinkSync(f.path); } catch {}
+  }
+}
+
+/* Validate + prepare ALL uploaded attachments for a turn (§12, §13):
+   classification, magic-byte validation, per-plan document size
+   limits and text extraction. Throws user-safe coded errors (with
+   HTTP status) naming the offending file; temp files are cleaned up
+   on every failure.                                                */
+async function buildMessageAttachments(req, { planCfg = null, isPro = false } = {}) {
+  const files = normalizeUploadedFiles(req);
+  if (!files.length) return { metas: [], imageDataUrls: [], messageType: 'text' };
+
+  const docLimit = Math.round(aiConfig.limits.documentSizeBytes * (planCfg?.docSizeMultiplier || 1));
+  const metas = [];
+  const imageDataUrls = [];
+  let hasImage = false, hasDocument = false;
+
+  try {
+    for (const file of files) {
+      const kind = documentService.classify(file.originalname, file.mimetype);
+      if (kind === 'unknown')
+        throw documentService.coded('UNSUPPORTED_FILE', `"${file.originalname}" is not a supported file type yet. Attach images, PDF, DOCX, TXT, CSV, JSON or code files.`);
+      if (kind === 'audio')
+        throw documentService.coded('UNSUPPORTED_FILE', `"${file.originalname}" is an audio file — use the voice input feature instead of chat attachments.`);
+
+      const valid = documentService.validateUpload(file.path, kind, file.originalname);
+
+      if (kind === 'document' && valid.size > docLimit) {
+        throw Object.assign(documentService.coded('PLAN_SIZE_LIMIT',
+          `"${file.originalname}" is too large for your ${planCfg?.name || 'current'} plan. Maximum document size is ${(docLimit / (1024 * 1024)).toFixed(0)} MB.`), { status: 413, upgradeHint: !isPro });
+      }
+
+      const meta = { kind, url: `/uploads/${file.filename}`, name: file.originalname, mime: file.mimetype, size: valid.size };
+
+      if (kind === 'image') {
+        const b64 = fs.readFileSync(file.path).toString('base64');
+        imageDataUrls.push(`data:${file.mimetype};base64,${b64}`);
+        hasImage = true;
+      } else {
+        // Honest document processing (§14): text is extracted NOW — a
+        // failure surfaces before anything is saved or answered.
+        const extract = await documentService.extractText(file.path, file.originalname, file.mimetype);
+        meta.extracted_text = extract.text;
+        meta.pages = extract.pages ?? null;
+        hasDocument = true;
+      }
+      metas.push(meta);
+    }
+  } catch (err) {
+    cleanupUploads(req);
+    throw err;
+  }
+
+  return { metas, imageDataUrls, messageType: hasImage ? 'image' : (hasDocument ? 'document' : 'text') };
+}
+
+/* Shared send-message turn (SSE). Used by BOTH:
+   • POST /api/chats/messages/stream          (lazy conversation create, §3)
+   • POST /api/chats/:id/messages/stream      (existing conversation)
+   Runs every validation BEFORE the daily-usage reservation, which
+   itself runs before any SSE output — so rejections are plain JSON
+   and over-limit requests never reach the AI provider (§3, §36).  */
+async function handleChatMessageTurn(req, res, { chat = null, isNew = false }) {
+  const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
+  let chatId = chat ? String(chat._id) : null;
+
+  const prepared = await buildMessageAttachments(req, {
+    planCfg: req._planCfg, isPro: req._plan === 'pro',
+  });
+  if (!content && !prepared.metas.length) {
+    cleanupUploads(req);
+    return res.status(400).json({ error: 'Message or attachment required' });
+  }
+
+  if (content) {
+    const mod = await moderateContent(content);
+    if (mod.flagged) {
+      cleanupUploads(req);
+      await FlaggedContent.create({ chat_id: chatId, user_id: req.user.id, reason: mod.reason, auto_flagged: true });
+      return res.status(400).json({ error: 'Your message was flagged. Please keep conversations respectful.' });
+    }
+  }
+
+  /* Lazy creation (§3) happens ONLY after every pre-AI validation has
+     passed — a rejected request (bad file, flagged text) must never
+     leave an empty conversation behind. */
+  if (isNew && !chat) {
+    const mode = ['chat', 'agent'].includes(req.body?.mode) ? req.body.mode : 'chat';
+    for (let attempt = 0; attempt < 3 && !chat; attempt++) {
+      try {
+        chat = await Chat.create({ user_id: req.user.id, title: 'New Chat', conversation_id: newConversationId(), mode });
+      } catch (err) {
+        // Duplicate conversation_id — regenerate and retry (astronomically rare)
+        if (err?.code !== 11000) throw err;
+      }
+    }
+    if (!chat) return res.status(500).json({ error: 'Could not create the conversation. Please try again.' });
+    chatId = String(chat._id);
+    logActivity('new_chat', { username: req.user.username, user_id: req.user.id, meta: { chatId } });
+  }
+
+  // Atomic daily-chat reservation — AFTER every validation, BEFORE the
+  // AI call (§3, §36). Rejected requests never consume allowance.
+  const reservation = await reserveChatUsage(req, res);
+  if (!reservation) {
+    cleanupUploads(req);
+    // Roll the freshly-created row back — over-limit requests must not
+    // create phantom empty conversations.
+    if (isNew && chat) { try { await Chat.deleteOne({ _id: chat._id }); } catch {} }
+    return;
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
+  // Lazy-create flow: hand the public conversation id to the client
+  // FIRST so it can navigate to /chat/c/{conversationId} immediately (§3).
+  if (isNew) {
+    send('conversation', {
+      conversationId: chat.conversation_id,
+      chatId,
+      title: chat.title,
+      mode: chat.mode,
+    });
+  }
+
+  // Mode persistence (§31/§32): whitelisted, only 'chat' today — the
+  // field exists so the future Agent mode opens without re-architecting.
+  const mode = ['chat', 'agent'].includes(req.body?.mode) ? req.body.mode : null;
+  if (mode && mode !== chat.mode) chat.mode = mode;
+
+  const userMsg = await Message.create({
+    chat_id: chatId, role: 'user', content,
+    file_url: prepared.metas[0]?.url || null,
+    message_type: prepared.messageType,
+    attachments: prepared.metas,
+  });
+  send('user_message', fmtMessage(userMsg));
+  logActivity('message', { username: req.user.username, user_id: req.user.id, meta: { chatId } });
+
+  // Auto-title from the first message (or first attachment name)
+  const msgCount = await Message.countDocuments({ chat_id: chatId });
+  if (msgCount <= 1) {
+    const title = content ? content.slice(0, 60) : (prepared.metas[0]?.name || 'New Chat').replace(/\.[a-z0-9]+$/i, '').slice(0, 60);
+    if (title && title !== chat.title) chat.title = title;
+  }
+  await chat.save();
+
+  const trackType = prepared.messageType === 'image' ? 'image' : (prepared.messageType === 'document' ? 'document' : 'chat');
+  await runAssistantTurn(req, res, { chat, send, startedAt: Date.now(), trackType, reservation, planCfg: req._planCfg });
+}
+
+/* Shared pre-turn checks for message endpoints (plan status + burst
+   limits). Attaches req._plan / req._planCfg for downstream helpers. */
+async function preflightTurn(req, res, { withUploadLimiter = false } = {}) {
   const { plan, planStatus, planCfg } = await getPlanContext(req.user.id);
-  if (!['active', 'pending'].includes(planStatus))
-    return res.status(403).json({ error: 'Your subscription is not active. Please contact support.', code: 'SUBSCRIPTION_INACTIVE' });
-
-  // Abuse protection (§20): plan-scaled burst limits.
+  if (!['active', 'pending'].includes(planStatus)) {
+    res.status(403).json({ error: 'Your subscription is not active. Please contact support.', code: 'SUBSCRIPTION_INACTIVE' });
+    return false;
+  }
   const mult = planCfg?.burstMultiplier || 1;
   const rl = rateLimiter.allow(req.user.id, 'chat', {
     limit: Math.round(aiConfig.rateLimits.chat.limit * mult),
     windowMs: aiConfig.rateLimits.chat.windowMs,
   });
-  if (!rl.ok) return rateLimiter.tooMany(res, rl.retryAfterSec);
-  if (req.file) {
+  if (!rl.ok) { rateLimiter.tooMany(res, rl.retryAfterSec); return false; }
+  if (withUploadLimiter && normalizeUploadedFiles(req).length) {
     const ul = rateLimiter.allow(req.user.id, 'upload', {
       limit: Math.round(aiConfig.rateLimits.upload.limit * mult),
       windowMs: aiConfig.rateLimits.upload.windowMs,
     });
-    if (!ul.ok) return rateLimiter.tooMany(res, ul.retryAfterSec);
+    if (!ul.ok) { rateLimiter.tooMany(res, ul.retryAfterSec); return false; }
   }
+  req._plan = plan; req._planCfg = planCfg;
+  return true;
+}
 
-  const startTime = Date.now();
-  let reservation = null;
-
+/* ── SEND MESSAGE — FIRST message CREATES the conversation (§3) ─
+   POST /api/chats/messages/stream
+   No empty conversations are ever created from the UI: the chat row
+   is inserted here, with its UUID conversation_id, then the turn
+   proceeds exactly like an existing-conversation send.             */
+app.post('/api/chats/messages/stream', authGuard, uploadChatFields, async (req, res) => {
   try {
-    const chat = await Chat.findOne({ _id: chatId, user_id: req.user.id });
-    if (!chat) return res.status(404).json({ error: 'Chat not found' });
+    if (!(await preflightTurn(req, res, { withUploadLimiter: true }))) { cleanupUploads(req); return; }
 
-    if (content) {
-      const mod = await moderateContent(content);
-      if (mod.flagged) {
-        await FlaggedContent.create({ chat_id: chatId, user_id: req.user.id, reason: mod.reason, auto_flagged: true });
-        return res.status(400).json({ error: 'Your message was flagged. Please keep conversations respectful.' });
-      }
-    }
+    const hasFiles = normalizeUploadedFiles(req).length > 0;
+    if (!String(req.body?.content || '').trim() && !hasFiles)
+      return res.status(400).json({ error: 'Message or attachment required' });
 
-    // Validate/prepare the attachment BEFORE any SSE output so client
-    // errors arrive as normal JSON the frontend can display honestly.
-    let prepared;
-    try { prepared = prepareAttachment(req); }
-    catch (err) { return res.status(400).json({ error: friendlyError(err) }); }
-
-    // Plan-based document allowance: documents beyond the caller's plan
-    // limit are rejected BEFORE the AI is involved (§1, §27).
-    if (prepared.meta?.kind === 'document' && req.file) {
-      const base = aiConfig.limits.documentSizeBytes;
-      const docLimit = Math.round(base * (planCfg?.docSizeMultiplier || 1));
-      if (req.file.size > docLimit) {
-        try { fs.unlinkSync(req.file.path); } catch {}
-        return res.status(413).json({
-          error: `That document is too large for your ${planCfg?.name || 'current'} plan. Maximum size is ${(docLimit / (1024 * 1024)).toFixed(0)} MB.`,
-          code: 'PLAN_SIZE_LIMIT', upgradeHint: plan !== 'pro',
-        });
-      }
-    }
-
-    let documentExtract = null;
-    if (prepared.needsExtract) {
-      try {
-        documentExtract = await documentService.extractText(req.file.path, req.file.originalname, req.file.mimetype);
-      } catch (err) {
-        // Honest failure (§6): no fabricated reading of the document
-        return res.status(422).json({ error: friendlyError(err), attachmentSaved: false });
-      }
-    }
-
-    // Atomic daily-chat reservation — happens AFTER every validation so
-    // rejected requests never consume allowance, and BEFORE the AI call
-    // so an over-limit request never reaches the provider (§3, §36).
-    const reservation = await reserveChatUsage(req, res);
-    if (!reservation) return;
-
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders();
-
-    const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-
-    const meta = prepared.meta ? { ...prepared.meta } : null;
-    if (meta && documentExtract) {
-      meta.extracted_text = documentExtract.text;
-      meta.pages = documentExtract.pages;
-    }
-
-    const userMsg = await Message.create({
-      chat_id: chatId, role: 'user', content: content || '',
-      file_url: meta ? meta.url : null,
-      message_type: prepared.messageType,
-      attachments: meta ? [meta] : [],
-    });
-    send('user_message', fmtMessage(userMsg));
-    logActivity('message', { username: req.user.username, user_id: req.user.id, meta: { chatId } });
-
-    // Auto-title
-    const msgCount = await Message.countDocuments({ chat_id: chatId });
-    if (msgCount <= 1 && content) {
-      chat.title = content.slice(0, 60);
-      await chat.save();
-    }
-
-    await runAssistantTurn(req, res, { chat, send, startedAt: startTime, trackType: prepared.messageType === 'image' ? 'image' : (prepared.messageType === 'document' ? 'document' : 'chat'), reservation, planCfg });
+    await handleChatMessageTurn(req, res, { chat: null, isNew: true });
   } catch (err) {
+    cleanupUploads(req);
+    console.error('[ConversationCreate]', err);
+    if (!res.headersSent) return res.status(httpErrorStatus(err)).json({ error: friendlyError(err) });
+    try { res.write(`event: error\ndata: ${JSON.stringify({ message: friendlyError(err) })}\n\n`); res.end(); } catch { res.end(); }
+  }
+});
+
+/* ── SEND MESSAGE to an EXISTING conversation (SSE Streaming) ──
+   :id accepts the public conversation_id (UUID) or a Mongo id —
+   both ownership-checked server-side (§5).                        */
+app.post('/api/chats/:id/messages/stream', authGuard, uploadChatFields, async (req, res) => {
+  try {
+    if (!(await preflightTurn(req, res, { withUploadLimiter: true }))) { cleanupUploads(req); return; }
+
+    const chat = await resolveChatParam(req, res);
+    if (!chat) { cleanupUploads(req); return; }
+
+    await handleChatMessageTurn(req, res, { chat, isNew: false });
+  } catch (err) {
+    cleanupUploads(req);
     console.error('[Stream]', err);
-    await refundReservation(req, reservation);
-    // Headers may not be sent yet if a pre-stream step threw
+    await refundReservation(req, req._reservation || null);
     if (!res.headersSent) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.flushHeaders();
+      if (err?.code === 'CONVERSATION_NOT_FOUND')
+        return res.status(404).json({ error: friendlyError(err), code: err.code });
+      return res.status(httpErrorStatus(err)).json({ error: friendlyError(err) });
     }
     try {
       res.write(`event: error\ndata: ${JSON.stringify({ message: friendlyError(err) })}\n\n`);
-      await trackUsage(req.user.id, chatId, 0, 'chat', Date.now() - startTime, false);
       res.end();
     } catch { res.end(); }
   }
 });
 
-/* ── REGENERATE last response (SSE, §16) ─────────────────────── */
-app.post('/api/chats/:id/regenerate/stream', authGuard, async (req, res) => {
-  const chatId = req.params.id;
+/* ── REGENERATE a response (SSE, §19/§20) ──────────────────────
+   POST /api/chats/:id/messages/:messageId/regenerate
+   messageId = the USER message whose answer is regenerated.
+   • Latest answer regenerated → its document becomes the "carrier":
+     the previous answer is preserved as a version (‹ n/m › nav),
+     the new answer becomes active. Nothing is destroyed on failure.
+   • Mid-conversation regenerate → everything after that turn is
+     superseded (branch reset), a fresh answer is generated.        */
+async function handleRegenerate(req, res, { chat, targetUserMsg }) {
+  // Usage reservation FIRST — a reached daily limit must never mutate
+  // the visible conversation (the old answer stays exactly as it was).
+  const reservation = await reserveChatUsage(req, res);
+  if (!reservation) return;
 
-  const { plan, planStatus, planCfg } = await getPlanContext(req.user.id);
-  if (!['active', 'pending'].includes(planStatus))
-    return res.status(403).json({ error: 'Your subscription is not active. Please contact support.', code: 'SUBSCRIPTION_INACTIVE' });
-  const mult = planCfg?.burstMultiplier || 1;
-  const rl = rateLimiter.allow(req.user.id, 'chat', {
-    limit: Math.round(aiConfig.rateLimits.chat.limit * mult),
-    windowMs: aiConfig.rateLimits.chat.windowMs,
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  send('user_message', fmtMessage(targetUserMsg));
+
+  // Active assistant answers after the target user message
+  const activeAfter = await Message.find({
+    chat_id: chat._id, role: 'assistant', superseded: { $ne: true }, _id: { $gt: targetUserMsg._id },
+  }).sort({ created_at: 1, _id: 1 }).select('content model tokens created_at processing_ms status versions').lean();
+
+  // Later USER turns still visible? → regenerating an older branch
+  const laterUserCount = await Message.countDocuments({
+    chat_id: chat._id, role: 'user', superseded: { $ne: true }, _id: { $gt: targetUserMsg._id },
   });
-  if (!rl.ok) return rateLimiter.tooMany(res, rl.retryAfterSec);
 
-  let reservation = null;
+  let carrier = null;
+  if (laterUserCount > 0) {
+    // Branch reset: hide everything after the target turn (§18) — the
+    // data stays in the database, the conversation view stays clean.
+    await Message.updateMany(
+      { chat_id: chat._id, _id: { $gt: targetUserMsg._id }, superseded: { $ne: true } },
+      { $set: { superseded: true } }
+    );
+  } else if (activeAfter.length) {
+    // Normal regenerate of the newest answer — reuse its document as
+    // the version carrier. Legacy duplicate assistants are removed.
+    const newest = activeAfter[activeAfter.length - 1];
+    carrier = await Message.findById(newest._id);
+    const extraIds = activeAfter.slice(0, -1).map(m => m._id);
+    if (extraIds.length) await Message.deleteMany({ _id: { $in: extraIds } });
+  }
+
+  await runAssistantTurn(req, res, {
+    chat, send, startedAt: Date.now(), trackType: 'regenerate',
+    reservation, planCfg: req._planCfg, carrier,
+    excludeMessageId: carrier?._id || null,
+  });
+}
+
+app.post('/api/chats/:id/messages/:messageId/regenerate', authGuard, async (req, res) => {
   try {
-    const chat = await Chat.findOne({ _id: chatId, user_id: req.user.id });
-    if (!chat) return res.status(404).json({ error: 'Chat not found' });
+    if (!(await preflightTurn(req, res))) return;
+    const chat = await resolveChatParam(req, res);
+    if (!chat) return;
+    const targetUserMsg = await Message.findOne({ _id: req.params.messageId, chat_id: chat._id, role: 'user', superseded: { $ne: true } });
+    if (!targetUserMsg) return res.status(404).json({ error: 'Message not found', code: 'MESSAGE_NOT_FOUND' });
+    await handleRegenerate(req, res, { chat, targetUserMsg });
+  } catch (err) {
+    console.error('[Regenerate:msg]', err);
+    if (!res.headersSent) return res.status(httpErrorStatus(err)).json({ error: friendlyError(err) });
+    try { res.write(`event: error\ndata: ${JSON.stringify({ message: friendlyError(err) })}\n\n`); res.end(); } catch { res.end(); }
+  }
+});
 
-    const lastUser = await Message.findOne({ chat_id: chatId, role: 'user' }).sort({ created_at: -1, _id: -1 }).lean();
+/* ── REGENERATE the LAST response (SSE, legacy-compatible path) ── */
+app.post('/api/chats/:id/regenerate/stream', authGuard, async (req, res) => {
+  try {
+    if (!(await preflightTurn(req, res))) return;
+    const chat = await resolveChatParam(req, res);
+    if (!chat) return;
+    const lastUser = await Message.findOne({ chat_id: chat._id, role: 'user', superseded: { $ne: true } })
+      .sort({ created_at: -1, _id: -1 });
     if (!lastUser) return res.status(400).json({ error: 'Nothing to regenerate yet.' });
-
-    // Drop assistant messages generated after the last user message
-    await Message.deleteMany({ chat_id: chatId, role: 'assistant', _id: { $gt: lastUser._id } });
-
-    // Atomic daily-chat reservation — regenerate consumes allowance too
-    reservation = await reserveChatUsage(req, res);
-    if (!reservation) return;
-
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders();
-    const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-    send('user_message', fmtMessage(lastUser));
-
-    await runAssistantTurn(req, res, { chat, send, startedAt: Date.now(), trackType: 'regenerate', reservation, planCfg });
+    await handleRegenerate(req, res, { chat, targetUserMsg: lastUser });
   } catch (err) {
     console.error('[Regenerate]', err);
-    await refundReservation(req, reservation);
-    if (!res.headersSent) { res.setHeader('Content-Type', 'text/event-stream'); res.flushHeaders(); }
+    if (!res.headersSent) return res.status(httpErrorStatus(err)).json({ error: friendlyError(err) });
     try { res.write(`event: error\ndata: ${JSON.stringify({ message: friendlyError(err) })}\n\n`); res.end(); } catch { res.end(); }
   }
 });
@@ -1247,75 +1609,52 @@ app.post('/api/tts', authGuard, async (req, res) => {
 });
 
 /* ── SEND MESSAGE (non-streaming fallback) ───────────────────── */
-app.post('/api/chats/:id/messages', authGuard, uploadChat.single('file'), async (req, res) => {
-  const { content } = req.body;
-  const chatId = req.params.id;
-  if (!content && !req.file) return res.status(400).json({ error: 'Message or file required' });
+app.post('/api/chats/:id/messages', authGuard, uploadChatFields, async (req, res) => {
+  const content = typeof req.body?.content === 'string' ? req.body.content.trim() : '';
   const startTime = Date.now();
 
-  const { plan, planStatus, planCfg } = await getPlanContext(req.user.id);
-  if (!['active', 'pending'].includes(planStatus))
-    return res.status(403).json({ error: 'Your subscription is not active. Please contact support.', code: 'SUBSCRIPTION_INACTIVE' });
-  const mult = planCfg?.burstMultiplier || 1;
-  const rl = rateLimiter.allow(req.user.id, 'chat', {
-    limit: Math.round(aiConfig.rateLimits.chat.limit * mult),
-    windowMs: aiConfig.rateLimits.chat.windowMs,
-  });
-  if (!rl.ok) return rateLimiter.tooMany(res, rl.retryAfterSec);
+  if (!(await preflightTurn(req, res, { withUploadLimiter: true }))) { cleanupUploads(req); return; }
+  const plan = req._plan, planCfg = req._planCfg;
 
   let reservation = null;
   try {
-    const chat = await Chat.findOne({ _id: chatId, user_id: req.user.id });
-    if (!chat) return res.status(404).json({ error: 'Chat not found' });
+    const chat = await resolveChatParam(req, res);
+    if (!chat) { cleanupUploads(req); return; }
+    const chatId = String(chat._id);
+
+    const prepared = await buildMessageAttachments(req, { planCfg, isPro: plan === 'pro' });
+    if (!content && !prepared.metas.length) {
+      cleanupUploads(req);
+      return res.status(400).json({ error: 'Message or attachment required' });
+    }
 
     if (content) {
       const mod = await moderateContent(content);
       if (mod.flagged) {
+        cleanupUploads(req);
         await FlaggedContent.create({ chat_id: chatId, user_id: req.user.id, reason: mod.reason, auto_flagged: true });
         return res.status(400).json({ error: 'Message flagged. Please keep conversations respectful.' });
       }
     }
 
-    let prepared;
-    try { prepared = prepareAttachment(req); }
-    catch (err) { return res.status(400).json({ error: friendlyError(err) }); }
-
-    // Plan-based document allowance (§27)
-    if (prepared.meta?.kind === 'document' && req.file) {
-      const docLimit = Math.round(aiConfig.limits.documentSizeBytes * (planCfg?.docSizeMultiplier || 1));
-      if (req.file.size > docLimit) {
-        try { fs.unlinkSync(req.file.path); } catch {}
-        return res.status(413).json({
-          error: `That document is too large for your ${planCfg?.name || 'current'} plan. Maximum size is ${(docLimit / (1024 * 1024)).toFixed(0)} MB.`,
-          code: 'PLAN_SIZE_LIMIT', upgradeHint: plan !== 'pro',
-        });
-      }
-    }
-
-    let documentExtract = null;
-    if (prepared.needsExtract) {
-      try { documentExtract = await documentService.extractText(req.file.path, req.file.originalname, req.file.mimetype); }
-      catch (err) { return res.status(422).json({ error: friendlyError(err) }); }
-    }
-
     // Atomic daily-chat reservation (§3, §36) — after validations,
     // before any AI provider call.
     reservation = await reserveChatUsage(req, res);
-    if (!reservation) return;
-
-    const meta = prepared.meta ? { ...prepared.meta } : null;
-    if (meta && documentExtract) { meta.extracted_text = documentExtract.text; meta.pages = documentExtract.pages; }
+    if (!reservation) { cleanupUploads(req); return; }
 
     const userMsg = await Message.create({
-      chat_id: chatId, role: 'user', content: content || '',
-      file_url: meta ? meta.url : null,
+      chat_id: chatId, role: 'user', content,
+      file_url: prepared.metas[0]?.url || null,
       message_type: prepared.messageType,
-      attachments: meta ? [meta] : [],
+      attachments: prepared.metas,
     });
     logActivity('message', { username: req.user.username, user_id: req.user.id, meta: { chatId } });
 
     const msgCount = await Message.countDocuments({ chat_id: chatId });
-    if (msgCount <= 1 && content) { chat.title = content.slice(0, 60); await chat.save(); }
+    if (msgCount <= 1) {
+      const title = content ? content.slice(0, 60) : (prepared.metas[0]?.name || 'New Chat');
+      if (title && title !== chat.title) { chat.title = title; }
+    }
 
     // Context via AI Core (plan-aware bounded window + budget + rolling summary)
     const planContextMult = planCfg?.contextMessages ? Math.min(8, Math.max(1, planCfg.contextMessages / 10)) : 1;
@@ -1326,10 +1665,10 @@ app.post('/api/chats/:id/messages', authGuard, uploadChat.single('file'), async 
     const ragCtx = cfg.knowledge_base_enabled && content ? await searchKnowledgeBase(content) : '';
     const documentContext = chatService.findRecentDocumentContext(kept);
 
-    // Vision turn (image understanding — new attachment or re-attached prior image)
+    // Vision turn (image understanding — new attachments or re-attached prior image)
     let result;
     let priorImage = null;
-    if (!prepared.imageDataUrl) {
+    if (!prepared.imageDataUrls.length) {
       const priorAtt = chatService.findRecentImageContext(kept);
       if (priorAtt) {
         try {
@@ -1341,12 +1680,12 @@ app.post('/api/chats/:id/messages', authGuard, uploadChat.single('file'), async 
     }
 
     try {
-      if (prepared.imageDataUrl || priorImage) {
+      if (prepared.imageDataUrls.length || priorImage) {
         const historyText = kept.filter(m => !(String(m._id) === String(userMsg._id)) && m.content?.trim())
           .slice(-6).map(m => ({ role: m.role, content: m.content.trim() }));
         result = await provider.visionComplete({
-          prompt: content || (prepared.imageDataUrl ? 'What is in this image? Describe it in detail.' : `Tell me more about this image (${priorImage.name}).`),
-          imageDataUrl: prepared.imageDataUrl || priorImage.dataUrl,
+          prompt: content || (prepared.imageDataUrls.length ? 'What is in this image? Describe it in detail.' : `Tell me more about this image (${priorImage.name}).`),
+          imageDataUrl: prepared.imageDataUrls[0] || priorImage.dataUrl,
           history: historyText, systemPrompt: cfg.system_prompt,
           maxTokens: cfg.max_tokens, temperature: cfg.temperature,
         });
@@ -1373,16 +1712,16 @@ app.post('/api/chats/:id/messages', authGuard, uploadChat.single('file'), async 
     }
     if (reservation) reservation.completed = true;
 
-    const sources = (!prepared.imageDataUrl && documentContext)
+    const sources = (!prepared.imageDataUrls.length && documentContext)
       ? [`${documentContext.name}${documentContext.pages ? ` (${documentContext.pages} pages)` : ''}`]
       : [];
 
-    const aiMsg = await Message.create({
-      chat_id: chatId, role: 'assistant', content: aiText,
-      model: result.model, provider: aiConfig.provider, tokens: result.tokens,
-      processing_ms: Date.now() - startTime, status: 'completed', sources,
+    const aiMsg = await saveAssistantResult({
+      chatId, content: aiText, model: result.model, tokens: result.tokens,
+      processingMs: Date.now() - startTime, status: 'completed', sources, provider: aiConfig.provider,
     });
     chat.updated_at = new Date();
+    chat.model = result.model;
     await chat.save();
 
     const tokens = result.tokens || estimateTokens(kept.map(m => m.content).join('\n') + aiText);
@@ -1397,8 +1736,115 @@ app.post('/api/chats/:id/messages', authGuard, uploadChat.single('file'), async 
     res.json({ userMessage: fmtMessage(userMsg), aiMessage: fmtMessage(aiMsg) });
   } catch (err) {
     console.error('[Message]', err);
+    if (err?.userSafe) return res.status(err?.status || 400).json({ error: err.message, code: err.code || undefined, upgradeHint: err.upgradeHint });
     res.status(500).json({ error: friendlyError(err) });
   }
+});
+
+/* ── EDIT a sent message (§17/§18/§22) ─────────────────────────
+   PATCH /api/chats/:id/messages/:messageId
+   User messages only. Accepts JSON (text-only edit) or multipart
+   (attachment changes: new files[] + keep_attachments url list).
+   Everything AFTER the edited turn is superseded (branch reset,
+   §18) — preserved in the database, hidden from the conversation.
+   The client then triggers regeneration of the response.          */
+app.patch('/api/chats/:id/messages/:messageId', authGuard, uploadChatFields, async (req, res) => {
+  try {
+    const planCtx = await getPlanContext(req.user.id);
+    if (!['active', 'pending'].includes(planCtx.planStatus))
+      return res.status(403).json({ error: 'Your subscription is not active. Please contact support.', code: 'SUBSCRIPTION_INACTIVE' });
+
+    const chat = await resolveChatParam(req, res);
+    if (!chat) { cleanupUploads(req); return; }
+
+    const msg = await Message.findOne({ _id: req.params.messageId, chat_id: chat._id });
+    if (!msg || msg.superseded) { cleanupUploads(req); return res.status(404).json({ error: 'Message not found', code: 'MESSAGE_NOT_FOUND' }); }
+    if (msg.role !== 'user') { cleanupUploads(req); return res.status(400).json({ error: 'Only your own messages can be edited.' }); }
+
+    // Edited text (optional when attachments are being adjusted)
+    const newContent = typeof req.body?.content === 'string' ? req.body.content.trim() : null;
+
+    // Existing attachments: keep list (urls) — default keeps everything
+    let keptAttachments = [...(msg.attachments || [])];
+    if (typeof req.body?.keep_attachments === 'string') {
+      let keepUrls = null;
+      try { keepUrls = JSON.parse(req.body.keep_attachments); } catch {}
+      if (Array.isArray(keepUrls)) {
+        const wanted = new Set(keepUrls.map(u => String(u)));
+        keptAttachments = keptAttachments.filter(a => wanted.has(String(a.url)));
+      }
+    }
+
+    // New attachments (validated + extracted exactly like a fresh send)
+    const prepared = await buildMessageAttachments(req, {
+      planCfg: planCtx.planCfg, isPro: planCtx.plan === 'pro',
+    });
+
+    const finalAttachments = [...keptAttachments, ...prepared.metas];
+    const finalContent = newContent !== null ? newContent : msg.content;
+    if (!finalContent && !finalAttachments.length) {
+      cleanupUploads(req);
+      return res.status(400).json({ error: 'An edited message needs text or at least one attachment.' });
+    }
+
+    msg.edit_history.push({ content: msg.content, edited_at: new Date() });
+    msg.content = finalContent;
+    msg.attachments = finalAttachments;
+    msg.file_url = finalAttachments[0]?.url || null;
+    const hasImage = finalAttachments.some(a => a.kind === 'image');
+    const hasDocument = finalAttachments.some(a => a.kind === 'document');
+    msg.message_type = hasImage ? 'image' : (hasDocument ? 'document' : 'text');
+    await msg.save();
+
+    // Branch reset (§18): hide everything after the edited turn.
+    const result = await Message.updateMany(
+      { chat_id: chat._id, _id: { $gt: msg._id }, superseded: { $ne: true } },
+      { $set: { superseded: true } }
+    );
+
+    const io = req.app.get('io');
+    if (io) io.to(`chat_${String(chat._id)}`).emit('message_updated', { chatId: String(chat._id), userMessage: fmtMessage(msg) });
+
+    res.json({
+      userMessage: fmtMessage(msg),
+      removedResponses: result.modifiedCount || 0,
+      chat: { id: String(chat._id), conversation_id: chat.conversation_id, title: chat.title, mode: chat.mode },
+    });
+  } catch (err) {
+    cleanupUploads(req);
+    console.error('[EditMessage]', err);
+    if (err?.userSafe) return res.status(err?.status || 400).json({ error: err.message, code: err.code || undefined, upgradeHint: err.upgradeHint });
+    res.status(500).json({ error: friendlyError(err) });
+  }
+});
+
+/* ── SWITCH the active response version (§20) ──────────────────
+   PATCH /api/messages/:id  { version: index }                     */
+app.patch('/api/messages/:id', authGuard, async (req, res) => {
+  try {
+    const msg = await Message.findById(req.params.id);
+    if (!msg) return res.status(404).json({ error: 'Message not found' });
+    const chat = await Chat.findOne({ _id: msg.chat_id, user_id: req.user.id });
+    if (!chat) return res.status(403).json({ error: 'Forbidden' });
+
+    if (msg.role !== 'assistant' || !Array.isArray(msg.versions) || !msg.versions.length)
+      return res.status(400).json({ error: 'This message has no alternative responses.' });
+    const idx = Number(req.body?.version);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= msg.versions.length)
+      return res.status(400).json({ error: 'Invalid response version.' });
+
+    const v = msg.versions[idx];
+    msg.active_version = idx;
+    msg.content = v.content;
+    msg.model = v.model;
+    msg.tokens = v.tokens;
+    msg.status = v.status || 'completed';
+    await msg.save();
+
+    const io = req.app.get('io');
+    if (io) io.to(`chat_${String(chat._id)}`).emit('message_updated', { chatId: String(chat._id), aiMessage: fmtMessage(msg) });
+    res.json({ success: true, message: fmtMessage(msg) });
+  } catch { res.status(500).json({ error: 'Could not switch response version' }); }
 });
 
 app.delete('/api/messages/:id', authGuard, async (req, res) => {
@@ -1407,7 +1853,24 @@ app.delete('/api/messages/:id', authGuard, async (req, res) => {
     if (!msg) return res.status(404).json({ error: 'Message not found' });
     const chat = await Chat.findOne({ _id: msg.chat_id, user_id: req.user.id });
     if (!chat) return res.status(403).json({ error: 'Forbidden' });
+
+    if (msg.role === 'user') {
+      // Deleting a user message also removes its answer(s) from the
+      // visible thread — superseded, not destroyed (§21: never
+      // accidentally delete the user's preceding message).
+      const later = await Message.find({ chat_id: msg.chat_id, _id: { $gt: msg._id } })
+        .sort({ created_at: 1, _id: 1 }).select('role').lean();
+      const orphanIds = [];
+      for (const m of later) {
+        if (m.role === 'user') break; // answers of the NEXT turn stay
+        orphanIds.push(m._id);
+      }
+      if (orphanIds.length)
+        await Message.updateMany({ _id: { $in: orphanIds } }, { $set: { superseded: true } });
+    }
     await Message.deleteOne({ _id: req.params.id });
+    const io = req.app.get('io');
+    if (io) io.to(`chat_${String(msg.chat_id)}`).emit('message_deleted', { chatId: String(msg.chat_id), messageId: String(msg._id) });
     res.json({ success: true });
   } catch { res.status(500).json({ error: 'Could not delete message' }); }
 });
@@ -1416,18 +1879,20 @@ app.get('/api/search', authGuard, async (req, res) => {
   const { q } = req.query;
   if (!q) return res.json([]);
   try {
-    const userChats = await Chat.find({ user_id: req.user.id }).select('_id title').lean();
+    const userChats = await Chat.find({ user_id: req.user.id }).select('_id title conversation_id').lean();
     const chatIds = userChats.map(c => c._id);
     const chatMap = {};
-    userChats.forEach(c => { chatMap[c._id.toString()] = c.title; });
+    userChats.forEach(c => { chatMap[c._id.toString()] = { title: c.title, conversation_id: c.conversation_id || null }; });
     const messages = await Message.find({
       chat_id: { $in: chatIds },
+      superseded: { $ne: true },
       content: { $regex: q, $options: 'i' }
     }).sort({ created_at: -1 }).limit(20).lean();
     const result = messages.map(m => ({
       ...m, id: m._id.toString(), _id: undefined,
       chat_id: m.chat_id.toString(),
-      chat_title: chatMap[m.chat_id.toString()] || 'Unknown'
+      chat_title: chatMap[m.chat_id.toString()]?.title || 'Unknown',
+      chat_conversation_id: chatMap[m.chat_id.toString()]?.conversation_id || null,
     }));
     res.json(result);
   } catch { res.json([]); }
@@ -1570,6 +2035,40 @@ app.use((err, req, res, next) => {
 });
 
 /* ── START ───────────────────────────────────────────────────── */
+/* Idempotent migration (§35): every conversation that predates the
+   public conversation_id gets a UUID v4 backfilled in bounded
+   batches. Existing chats, messages and attachments are NEVER
+   touched beyond adding the identifier — users keep their history.
+   Safe to run on every boot: the query only matches what is missing. */
+async function migrateConversationIds() {
+  const BATCH = 200;
+  let migrated = 0;
+  for (;;) {
+    const missing = await Chat.find(
+      { $or: [{ conversation_id: { $exists: false } }, { conversation_id: null }, { conversation_id: '' }] },
+      { _id: 1 }
+    ).limit(BATCH).lean();
+    if (!missing.length) break;
+    const ops = missing.map(doc => ({
+      updateOne: {
+        filter: { _id: doc._id, $or: [{ conversation_id: { $exists: false } }, { conversation_id: null }, { conversation_id: '' }] },
+        update: { $set: { conversation_id: newConversationId() } },
+      },
+    }));
+    try {
+      const r = await Chat.bulkWrite(ops, { ordered: false });
+      migrated += r.modifiedCount || 0;
+    } catch (err) {
+      // Duplicate key on an (astronomically unlikely) UUID collision —
+      // the untouched rows are picked up by the next loop iteration.
+      if (err?.code !== 11000 && !err?.writeErrors) throw err;
+      migrated += (err?.result?.nModified) || 0;
+    }
+    if (missing.length < BATCH) break;
+  }
+  return migrated;
+}
+
 connectDB().then(async () => {
   // Normalize legacy admin roles — KinyaBot has exactly ONE role:
   // super_admin. Any legacy 'admin'/'moderator' rows are upgraded.
@@ -1593,6 +2092,11 @@ connectDB().then(async () => {
     );
     if (statuses.modifiedCount) console.log(`✅ Normalized ${statuses.modifiedCount} plan status(es) to active`);
   } catch (err) { console.error('[Plans] startup seed/migration failed:', err.message); }
+  // Conversation identity migration (§35): backfill UUID conversation_id
+  try {
+    const n = await migrateConversationIds();
+    if (n) console.log(`✅ Backfilled ${n} conversation(s) with public conversation_id`);
+  } catch (err) { console.error('[Migration] conversation_id backfill failed:', err.message); }
   server.listen(PORT, () => {
     const pkg = require('./package.json');
     console.log(`\n✅ KinyaBot v${pkg.version} (MongoDB) → http://localhost:${PORT}`);

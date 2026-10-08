@@ -40,11 +40,25 @@ const chatSchema = new Schema({
   user_id:   { type: Schema.Types.ObjectId, ref: 'User', required: true },
   title:     { type: String, default: 'New Chat', maxlength: 255 },
   is_pinned: { type: Boolean, default: false },
+  /* Public, collision-resistant conversation identifier (UUID v4).
+     Used in URLs as /chat/c/{conversation_id} — Mongo ObjectIds are
+     NEVER exposed in URLs. Unique + sparse so legacy documents
+     created before this field exist safely until the idempotent
+     startup migration backfills them (see app.js).               */
+  conversation_id: { type: String, default: null },
+  /* Conversation mode: 'chat' today, 'agent' reserved for the
+     upcoming Agent mode (tool calls, artifacts, execution logs).
+     Restored on load so the composer reopens in the right mode.   */
+  mode:  { type: String, enum: ['chat', 'agent'], default: 'chat' },
+  /* Model that produced the latest assistant response (display +
+     restoration purposes — the backend always picks the real model). */
+  model: { type: String, default: null },
   // Rolling context summary for very long conversations (AI Core §5)
   summary:       { type: String, default: null },
   summary_depth: { type: Number, default: 0 },   // message count covered by the summary
 }, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
 
+chatSchema.index({ conversation_id: 1 }, { unique: true, sparse: true });
 chatSchema.index({ user_id: 1, updated_at: -1 });
 chatSchema.index({ updated_at: -1 });
 chatSchema.index({ created_at: -1 });
@@ -70,6 +84,36 @@ const messageSchema = new Schema({
   file_url:      { type: String, default: null },            // legacy single-attachment field
   message_type:  { type: String, enum: ['text', 'image', 'document', 'audio'], default: 'text' },
   attachments:   { type: [attachmentSchema], default: [] },
+  /* ── Edit history (user messages) ────────────────────────────
+     Previous versions of an edited user message. The visible
+     conversation shows only `content`; edits stay recoverable
+     internally without cluttering the thread (§18).             */
+  edit_history:  {
+    type: [{ content: { type: String, default: '' }, edited_at: { type: Date, default: null } }],
+    default: [],
+  },
+  /* ── Response versions (assistant messages, §20) ─────────────
+     Regeneration appends the previous answer here instead of
+     destroying it. `content` always mirrors
+     versions[active_version] so context building stays simple.
+     versions = [oldest … newest]; active_version indexes into it
+     (null for legacy messages that were never regenerated).     */
+  versions: {
+    type: [{
+      content:      { type: String, default: '' },
+      model:        { type: String, default: null },
+      tokens:       { type: Number, default: null },
+      created_at:   { type: Date, default: null },
+      processing_ms:{ type: Number, default: null },
+      status:       { type: String, enum: ['completed', 'cancelled'], default: 'completed' },
+    }],
+    default: [],
+  },
+  active_version: { type: Number, default: null },
+  /* Branching: messages superseded by an edit/regenerate of an
+     earlier turn. Hidden from the active conversation and context
+     but preserved in the database for recovery/audit (§18).     */
+  superseded:    { type: Boolean, default: false },
   // AI provenance (assistant messages)
   model:         { type: String, default: null },
   provider:      { type: String, default: null },
@@ -82,6 +126,7 @@ const messageSchema = new Schema({
 }, { timestamps: { createdAt: 'created_at', updatedAt: false } });
 
 messageSchema.index({ chat_id: 1, created_at: 1 });
+messageSchema.index({ chat_id: 1, superseded: 1, created_at: 1 });
 messageSchema.index({ content: 'text' });
 // Superadmin analytics (time-series, per-model usage)
 messageSchema.index({ created_at: -1 });
