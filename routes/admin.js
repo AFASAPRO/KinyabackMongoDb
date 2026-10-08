@@ -24,6 +24,7 @@ const {
   User, Chat, Message, Admin, Notification, AdminNotification, AuditLog,
   SecurityEvent, PageView, SystemLog, UserMemory, KnowledgeBase,
   UsageTracking, UserPlan, FlaggedContent, PlanConfig, UsageDaily, PlanRequest,
+  SearchLog,
 } = require('../models')
 
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'kinyabot_admin_secret_change_me'
@@ -37,6 +38,7 @@ const { writeAudit } = require('../services/audit')
 const { notifyAdmins, notifyUser } = require('../services/notify')
 const pushService   = require('../services/push')
 const healthCheck   = require('../services/healthCheck')
+const langSearch    = require('../services/search/langSearchProvider')
 
 const router = express.Router()
 
@@ -215,6 +217,26 @@ router.get('/overview', async (req, res) => {
     let subscription = null
     try { subscription = await subscriptionStats(30) } catch { subscription = null }
 
+    // Web Search health strip (§37) — real SearchLog aggregates + a
+    // lightweight provider status. Never includes the API key.
+    let websearch = null
+    try {
+      const startToday = new Date(); startToday.setHours(0, 0, 0, 0)
+      const [wsToday, wsAgg] = await Promise.all([
+        SearchLog.countDocuments({ created_at: { $gte: startToday } }),
+        SearchLog.aggregate([{ $group: { _id: null, total: { $sum: 1 }, ok: { $sum: { $cond: [{ $eq: ['$status', 'success'] }, 1, 0] } }, avg_ms: { $avg: '$duration_ms' } } }]),
+      ])
+      const ws = wsAgg[0] || { total: 0, ok: 0, avg_ms: 0 }
+      websearch = {
+        searches_today: wsToday,
+        total: ws.total,
+        success_rate: ws.total ? Math.round((ws.ok / ws.total) * 1000) / 10 : null,
+        avg_latency_ms: ws.avg_ms ? Math.round(ws.avg_ms) : null,
+        provider: langSearch.isConfigured() ? 'connected' : 'not_configured',
+        enabled: settings.get().web_search_enabled,
+      }
+    } catch { websearch = null }
+
     res.json({
       range: r,
       users: {
@@ -235,6 +257,7 @@ router.get('/overview', async (req, res) => {
       moderation: { pending: pending_flags },
       notifications_unread: unread_notifs,
       subscription,
+      websearch,
       series: { users: userSeries, messages: msgSeries, ai: aiSeries },
       recent_users: recent_users.map(u => ({ id: u._id.toString(), username: u.username, email: u.email, is_banned: u.is_banned, created_at: u.created_at, last_login: u.last_login })),
       generated_at: new Date().toISOString(),
@@ -798,6 +821,180 @@ router.post('/ai/test', async (req, res) => {
       code: err.code || 'AI_PROVIDER_ERROR', response_ms: ms, status: 'failure',
     })
   }
+})
+
+/* ════════════════════════════════════════════════════════════════
+   WEB SEARCH — Superadmin analytics + operational config (§36-§38)
+   All numbers are real aggregations over the SearchLog collection.
+   The LangSearch API key is NEVER included in any response.
+════════════════════════════════════════════════════════════════ */
+
+/** Real connectivity probe of the configured LangSearch endpoint.
+ *  Reports connected / not_configured / unreachable — never the key. */
+async function langSearchHealth() {
+  if (!langSearch.isConfigured()) return { status: 'not_configured', detail: 'LANGSEARCH_API_KEY is not set on the backend' }
+  try {
+    // A 1-result probe query; cheap and validates auth + reachability.
+    const probe = await langSearch.webSearch({ query: 'kinyabot health probe', count: 1, timeoutMs: 8000 })
+    return { status: 'connected', detail: 'LangSearch Web Search responded normally', result_count: probe.sources.length }
+  } catch (err) {
+    return { status: err?.code === 'LANGSEARCH_AUTH' ? 'auth_error' : 'unreachable', detail: err?.code || 'LANGSEARCH_ERROR' }
+  }
+}
+
+router.get('/websearch/overview', async (req, res) => {
+  try {
+    const now = Date.now()
+    const startToday = new Date(); startToday.setHours(0, 0, 0, 0)
+    const startWeek = new Date(now - 7 * 86400e3)
+    const startMonth = new Date(now - 30 * 86400e3)
+    const startPrev = new Date(now - 60 * 86400e3)
+
+    const [total, today, week, month, prev] = await Promise.all([
+      SearchLog.countDocuments(),
+      SearchLog.countDocuments({ created_at: { $gte: startToday } }),
+      SearchLog.countDocuments({ created_at: { $gte: startWeek } }),
+      SearchLog.countDocuments({ created_at: { $gte: startMonth } }),
+      SearchLog.countDocuments({ created_at: { $gte: startPrev, $lt: startMonth } }),
+    ])
+
+    const [byPlan, byTrigger, statusAgg, latencyAgg, topQueries, topDomains, searchingUsers, recent] = await Promise.all([
+      SearchLog.aggregate([
+        { $group: { _id: '$plan', count: { $sum: 1 } } },
+        { $project: { plan: '$_id', count: 1, _id: 0 } }, { $sort: { count: -1 } },
+      ]),
+      SearchLog.aggregate([
+        { $group: { _id: '$trigger', count: { $sum: 1 } } },
+        { $project: { trigger: '$_id', count: 1, _id: 0 } }, { $sort: { count: -1 } },
+      ]),
+      SearchLog.aggregate([
+        { $group: { _id: '$status', count: { $sum: 1 } } },
+        { $project: { status: '$_id', count: 1, _id: 0 } },
+      ]),
+      SearchLog.aggregate([
+        { $match: { status: 'success' } },
+        { $group: { _id: null, avg_ms: { $avg: '$duration_ms' }, p: { $push: '$duration_ms' } } },
+      ]),
+      SearchLog.aggregate([
+        { $group: { _id: '$query', count: { $sum: 1 } } },
+        { $sort: { count: -1 } }, { $limit: 8 },
+        { $project: { query: '$_id', count: 1, _id: 0 } },
+      ]),
+      SearchLog.aggregate([
+        { $unwind: '$source_domains' },
+        { $group: { _id: '$source_domains', count: { $sum: 1 } } },
+        { $sort: { count: -1 } }, { $limit: 8 },
+        { $project: { domain: '$_id', count: 1, _id: 0 } },
+      ]),
+      SearchLog.distinct('user_id', { created_at: { $gte: startToday } }),
+      SearchLog.find().sort({ created_at: -1 }).limit(15)
+        .populate('user_id', 'username').select('query queries trigger plan result_count source_domains duration_ms status created_at').lean(),
+    ])
+
+    const statusMap = Object.fromEntries((statusAgg || []).map(s => [s.status, s.count]))
+    const attempts = total || 0
+    const succeeded = statusMap.success || 0
+    const durations = (latencyAgg[0]?.p || []).slice().sort((a, b) => a - b)
+    const at = (p) => durations.length ? durations[Math.min(durations.length - 1, Math.floor((p / 100) * durations.length))] : null
+    const health = await langSearchHealth()
+    const cfg = settings.get()
+
+    res.json({
+      health: {
+        ...health,
+        enabled: cfg.web_search_enabled,
+        auto_enabled: cfg.web_search_auto_enabled,
+      },
+      config: Object.fromEntries(WEBSEARCH_CONFIG_KEYS.map(k => [k, cfg[k]])),
+      totals: {
+        all: total, today, week, month,
+        change_30d: prev ? Math.round(((month - prev) / prev) * 1000) / 10 : null,
+      },
+      success_rate: attempts ? Math.round((succeeded / attempts) * 1000) / 10 : null,
+      avg_latency_ms: latencyAgg[0]?.avg_ms ? Math.round(latencyAgg[0].avg_ms) : null,
+      p95_ms: at(95),
+      by_plan: byPlan,
+      by_trigger: byTrigger,          // automatic vs manual vs agent (§36)
+      statuses: statusMap,            // success | empty | error | rate_limited
+      failed: (statusMap.error || 0) + (statusMap.rate_limited || 0),
+      empty: statusMap.empty || 0,
+      pro_users_searching_today: searchingUsers.length,
+      top_queries: topQueries,
+      top_domains: topDomains,
+      recent: recent.map(r => ({
+        id: r._id?.toString(), query: r.query, queries: r.queries, trigger: r.trigger,
+        plan: r.plan, result_count: r.result_count, source_domains: r.source_domains,
+        duration_ms: r.duration_ms, status: r.status, created_at: r.created_at,
+        username: r.user_id?.username || null,
+      })),
+      usage_note: 'LangSearch meters input/output tokens per request — quotas reset daily at 00:00 UTC.',
+      generated_at: new Date().toISOString(),
+    })
+  } catch (err) { console.error('[WebSearchOverview]', err); res.status(500).json({ error: 'Failed' }) }
+})
+
+const WEBSEARCH_CONFIG_KEYS = [
+  'web_search_enabled', 'web_search_auto_enabled', 'web_search_max_results',
+  'web_search_max_queries', 'web_search_cache_minutes', 'web_search_timeout_ms',
+  'web_search_allowed_domains', 'web_search_blocked_domains',
+]
+
+function validateWebSearchConfig(body = {}) {
+  const patch = {}
+  if (body.web_search_enabled !== undefined) patch.web_search_enabled = body.web_search_enabled === true
+  if (body.web_search_auto_enabled !== undefined) patch.web_search_auto_enabled = body.web_search_auto_enabled === true
+  if (body.web_search_max_results !== undefined) {
+    const n = Number(body.web_search_max_results)
+    if (!Number.isInteger(n) || n < 1 || n > 20) return { error: 'web_search_max_results must be an integer between 1 and 20' }
+    patch.web_search_max_results = n
+  }
+  if (body.web_search_max_queries !== undefined) {
+    const n = Number(body.web_search_max_queries)
+    if (!Number.isInteger(n) || n < 1 || n > 5) return { error: 'web_search_max_queries must be an integer between 1 and 5' }
+    patch.web_search_max_queries = n
+  }
+  if (body.web_search_cache_minutes !== undefined) {
+    const n = Number(body.web_search_cache_minutes)
+    if (!Number.isInteger(n) || n < 0 || n > 1440) return { error: 'web_search_cache_minutes must be an integer between 0 and 1440' }
+    patch.web_search_cache_minutes = n
+  }
+  if (body.web_search_timeout_ms !== undefined) {
+    const n = Number(body.web_search_timeout_ms)
+    if (!Number.isInteger(n) || n < 2000 || n > 30000) return { error: 'web_search_timeout_ms must be between 2000 and 30000' }
+    patch.web_search_timeout_ms = n
+  }
+  for (const key of ['web_search_allowed_domains', 'web_search_blocked_domains']) {
+    if (body[key] !== undefined) {
+      if (!Array.isArray(body[key])) return { error: `${key} must be an array of domains` }
+      const domains = body[key]
+        .map(d => String(d).toLowerCase().trim().replace(/^www\./, ''))
+        .filter(d => /^[a-z0-9.-]+\.[a-z]{2,}$/.test(d))
+        .slice(0, 50)
+      patch[key] = domains
+    }
+  }
+  if (!Object.keys(patch).length) return { error: 'Nothing to update' }
+  return { patch }
+}
+
+router.put('/websearch/config', async (req, res) => {
+  try {
+    const v = validateWebSearchConfig(req.body || {})
+    if (v.error) return res.status(400).json({ error: v.error })
+    const before = settings.get()
+    const updated = settings.update(v.patch)
+    await writeAudit(req.admin, 'websearch.config_update', {
+      resourceType: 'websearch_settings',
+      meta: {
+        changed: Object.keys(v.patch),
+        before: Object.fromEntries(Object.keys(v.patch).map(k => [k, before[k]])),
+        after: Object.fromEntries(Object.keys(v.patch).map(k => [k, updated[k]])),
+      },
+      req,
+    })
+    await notifyAdmins({ title: 'Web Search configuration updated', message: `${req.admin.username} updated: ${Object.keys(v.patch).join(', ')}.`, type: 'info', category: 'config', link: '/admin/websearch', dedupeKey: `ws-cfg-${req.admin.id}` }).catch(() => {})
+    res.json({ success: true, config: Object.fromEntries(WEBSEARCH_CONFIG_KEYS.map(k => [k, updated[k]])) })
+  } catch (err) { console.error('[WebSearchConfig]', err); res.status(500).json({ error: 'Failed to save' }) }
 })
 
 /* ════════════════════════════════════════════════════════════════

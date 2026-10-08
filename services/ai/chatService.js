@@ -128,13 +128,18 @@ function messageText(m) {
 }
 
 /* ── Prompt assembly ─────────────────────────────────────────── */
-function buildMessages({ systemPrompt, memory, ragContext, history, summary, documentContext, userText, imageDataUrl, imageDataUrls, priorImage }) {
+function buildMessages({ systemPrompt, memory, ragContext, searchContext, history, summary, documentContext, userText, imageDataUrl, imageDataUrls, priorImage }) {
   const contextBlocks = []
   if (memory && Object.keys(memory).length) {
     contextBlocks.push(`User context: ${Object.entries(memory).map(([k, v]) => `${k}=${v}`).join(', ')}`)
   }
   if (summary) contextBlocks.push(`Summary of earlier conversation:\n${summary}`)
   if (ragContext) contextBlocks.push(ragContext.trim())
+  // Web-grounded answers (Web Search §11): real retrieved sources only —
+  // the grounding instructions arrive inside searchContext from the
+  // orchestrator, so the model never answers "from the web" without
+  // actually having been given web evidence (§42).
+  if (searchContext) contextBlocks.push(searchContext.trim())
   if (documentContext) {
     const pages = documentContext.pages ? ` (${documentContext.pages} pages)` : ''
     contextBlocks.push(`[Attached document: ${documentContext.name}${pages}]\nThe user previously uploaded this document. Answer questions about it from this content; say clearly when something is not in the document.\n---\n${documentContext.text}\n---`)

@@ -24,6 +24,7 @@ const PLAN_IDS = ['free', 'plus', 'pro']
 const FEATURE_FLAGS = [
   'chatAccess', 'voiceAccess', 'imageGeneration', 'documentAnalysis',
   'advancedContext', 'agentAccess', 'priorityProcessing', 'advancedTools',
+  'webSearch',
 ]
 
 /* Human-readable upgrade paths: which plans a plan can request. */
@@ -42,6 +43,7 @@ const DEFAULTS = [
       chatAccess: true, voiceAccess: true, imageGeneration: true,
       documentAnalysis: true, advancedContext: false, agentAccess: false,
       priorityProcessing: false, advancedTools: true,
+      webSearch: false,
     },
     sort_order: 1,
   },
@@ -57,6 +59,7 @@ const DEFAULTS = [
       chatAccess: true, voiceAccess: true, imageGeneration: true,
       documentAnalysis: true, advancedContext: true, agentAccess: false,
       priorityProcessing: true, advancedTools: true,
+      webSearch: false,
     },
     sort_order: 2,
   },
@@ -72,6 +75,7 @@ const DEFAULTS = [
       chatAccess: true, voiceAccess: true, imageGeneration: true,
       documentAnalysis: true, advancedContext: true, agentAccess: false,
       priorityProcessing: true, advancedTools: true,
+      webSearch: true,
     },
     sort_order: 3,
   },
@@ -102,7 +106,12 @@ function normalizePlan(doc) {
   }
 }
 
-/** Seed / repair plan configuration documents (idempotent). */
+/** Seed / repair plan configuration documents (idempotent).
+ *  Two passes:
+ *    1. $setOnInsert — brand-new deployments get the full default.
+ *    2. Missing-flag repair — deployments created before a flag
+ *       existed get ONLY that flag filled with its default, never
+ *       overwriting admin-customized values (Web Search §27).     */
 async function ensureSeed() {
   for (const def of DEFAULTS) {
     try {
@@ -121,6 +130,15 @@ async function ensureSeed() {
         },
         { upsert: true }
       )
+      // Repair pass: flags added in later releases default on documents
+      // that predate them (normalizeFeatures treats missing as false,
+      // so without this, existing PRO accounts would lose new rights).
+      for (const [flag, value] of Object.entries(def.features)) {
+        await PlanConfig.updateOne(
+          { plan_id: def.plan_id, [`features.${flag}`]: { $exists: false } },
+          { $set: { [`features.${flag}`]: value } }
+        )
+      }
     } catch (err) { console.error('[Plans] seed failed:', err.message) }
   }
 }

@@ -26,6 +26,7 @@ const settings        = require('./services/settings');
 const plansService    = require('./services/plans');
 const usageService    = require('./services/usage');
 const authGuard       = require('./services/authGuard');
+const webSearchService = require('./services/search');
 const { attachIo, onlinePresence, logActivity } = require('./services/activity');
 const { notifyAdmins, notifyUser } = require('./services/notify');
 const pushService     = require('./services/push');
@@ -33,7 +34,7 @@ const pushService     = require('./services/push');
 const {
   User, Chat, Message, Admin, Notification, PageView,
   SystemLog, UserMemory, KnowledgeBase, UsageTracking,
-  UserPlan, FlaggedContent, SecurityEvent
+  UserPlan, FlaggedContent, SecurityEvent, SearchLog
 } = require('./models');
 
 // Firebase Admin init
@@ -337,6 +338,155 @@ async function featureGuard(req, res, feature, message) {
     return null;
   }
   return { plan };
+}
+
+/* ══════════════════════════════════════════════════════════════
+   WEB SEARCH — Pro-only web intelligence layer (§2, §26, §30)
+   ONE reusable backend service shared by Chat (auto + manual)
+   and the Agent's web_search tool. Free users NEVER reach
+   LangSearch: the entitlement is resolved server-side from the
+   UserPlan/PlanConfig collections, never from the request body.
+══════════════════════════════════════════════════════════════ */
+
+/** Conversation modes accepted on message turns. 'web_search' is the
+ *  explicit manual research mode; 'agent' stays reserved (Agent rules
+ *  govern it); anything else is plain chat with possible AUTO search. */
+const CHAT_MODES = ['chat', 'web_search', 'agent'];
+
+/** Server-side entitlement for web search (§2/§47): plan feature flag
+ *  AND global operational switches (AI Control §38). */
+async function webSearchEntitled(plan) {
+  if (!cfg.web_search_enabled) return false;
+  return plansService.canUseFeature(plan, 'webSearch');
+}
+
+/**
+ * Decide whether this turn performs a web search and with what trigger.
+ * Returns { trigger } — null = no search; 'manual' | 'auto' | 'agent'.
+ * `res` is answered (403) directly when a manual Web Search request
+ * comes from an unentitled account — LangSearch is NEVER called (§2).
+ */
+async function resolveSearchTrigger(req, res, { mode, plan }) {
+  if (mode === 'web_search') {
+    if (!(await webSearchEntitled(plan))) {
+      res.status(403).json({
+        error: 'Web Search is available with KinyaBot Pro.',
+        code: 'FEATURE_LOCKED',
+        feature: 'webSearch',
+        upgradeHint: true,
+      });
+      return { trigger: null };
+    }
+    return { trigger: 'manual' };
+  }
+  if (mode === 'agent') {
+    // Agent may use web_search as one of its tools (§31) — gated by the
+    // SAME entitlement (§30: no duplicated search system).
+    if (await webSearchEntitled(plan)) return { trigger: 'agent' };
+    return { trigger: null };
+  }
+  // Chat mode: AUTO search only when globally enabled AND the account
+  // is entitled. Free users simply never search — no error, no lock-in
+  // of normal chat (§28).
+  if (cfg.web_search_enabled && cfg.web_search_auto_enabled && (await webSearchEntitled(plan))) {
+    return { trigger: 'auto' };
+  }
+  return { trigger: null };
+}
+
+/** Serialize a search outcome for the client (safe subset — no internal
+ *  prompts, no decision reasoning, no URLs other than real sources §15). */
+function serializeSearchOutcome(outcome) {
+  if (!outcome) return null;
+  return {
+    performed: !!outcome.performed,
+    status: outcome.status,             // success | empty | unavailable | skipped | rate_limited
+    trigger: outcome.mode,              // auto | manual | agent
+    queries: (outcome.queries || []).slice(0, 5),
+    sources: (outcome.sources || []).slice(0, 12).map(s => ({
+      title: s.title, url: s.url, domain: s.domain,
+      snippet: String(s.snippet || '').slice(0, 300),
+      published_date: s.published_date || null,
+    })),
+    resultCount: outcome.resultCount || 0,
+    domains: (outcome.domains || []).slice(0, 12),
+    durationMs: outcome.durationMs || 0,
+    cached: !!outcome.cached,
+  };
+}
+
+/** Persist one REAL search attempt for analytics/observability (§21/§36).
+ *  Metadata only — never the retrieved page contents (§21). */
+async function logSearchAttempt({ req, chat, userText, outcome, plan }) {
+  try {
+    await SearchLog.create({
+      user_id: req.user.id,
+      chat_id: chat ? chat._id : null,
+      conversation_id: chat?.conversation_id || null,
+      query: String(userText || '').slice(0, 1000),
+      queries: (outcome.queries || []).slice(0, 5),
+      trigger: outcome.mode || 'auto',
+      plan: plan || 'free',
+      result_count: outcome.resultCount || 0,
+      source_domains: (outcome.domains || []).slice(0, 12),
+      duration_ms: outcome.durationMs || 0,
+      status: outcome.status === 'success' ? 'success'
+        : outcome.status === 'empty' ? 'empty'
+        : outcome.status === 'rate_limited' ? 'rate_limited' : 'error',
+      error_code: outcome.error || null,
+      cached: !!outcome.cached,
+      usage: outcome.usage ? { input_tokens: outcome.usage.input_tokens, output_tokens: outcome.usage.output_tokens } : null,
+    });
+  } catch { /* logging must never break the chat */ }
+}
+
+/**
+ * Run the web-search pipeline for one turn with live SSE activity
+ * (§13/§14). Per-user rate limiting lives INSIDE the orchestrator so
+ * a skipped auto-decision never consumes rate-limit budget (§26);
+ * every failure degrades to a normal knowledge answer, honestly
+ * labeled (§25) — a search outage can never fail the chat turn.
+ */
+async function runTurnSearch(req, res, { send, chat, userText, history, trigger, plan }) {
+  const outcome = await webSearchService.runWebSearch({
+    userText, userId: req.user.id, history, trigger,
+    callbacks: {
+      onStage: (stage, data) => {
+        send('search_status', { stage, ...data });
+        if (stage === 'unavailable') {
+          send('search_notice', {
+            message: data?.reason === 'rate_limited'
+              ? 'Web Search is cooling down for a moment — answering from existing knowledge.'
+              : 'Web Search is temporarily unavailable. I can still answer using my existing knowledge.',
+          });
+        }
+      },
+      onQuery: (query) => send('search_status', { stage: 'searching', query }),
+      onSources: (sourcesFound, domains) => send('search_status', { stage: 'reading', sourcesFound, domains }),
+    },
+  });
+
+  // Skipped decisions (auto mode, nothing worth searching) are NOT
+  // attempts — no log row, no client event; the turn is a normal chat.
+  if (outcome.status !== 'skipped') {
+    send('search_results', serializeSearchOutcome(outcome));
+    await logSearchAttempt({ req, chat, userText, outcome, plan });
+  }
+  return outcome;
+}
+
+/** Small recent-history slice for the decision/optimizer layers.
+ *  Cheap projection — full bounded context is rebuilt later by
+ *  runAssistantTurn for the actual model call. */
+async function recentTurnHistory(chatId, beforeMessageId = null) {
+  if (!chatId) return [];
+  try {
+    const q = { chat_id: chatId, superseded: { $ne: true } };
+    if (beforeMessageId) q._id = { $lt: beforeMessageId };
+    const rows = await Message.find(q).sort({ created_at: -1, _id: -1 }).limit(4)
+      .select('role content -_id').lean();
+    return rows.reverse().map(r => ({ role: r.role, content: r.content }));
+  } catch { return []; }
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -973,8 +1123,13 @@ function codeDeliveryPrompt(userText = '') {
                     carrier's `versions` history instead of creating
                     a new document (§19/§20).
      excludeMessageId — message to leave out of the context window
-                    (the carrier itself while it is being replaced). */
-async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = 'chat', reservation = null, planCfg = null, carrier = null, excludeMessageId = null }) {
+                    (the carrier itself while it is being replaced).
+     searchOutcome — web-search pipeline result for this turn (or
+                    null). When it carries real sources, the model
+                    receives structured SOURCE blocks + grounding
+                    instructions, and the saved answer records the
+                    actual queries/URLs (§11/§12/§42). */
+async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = 'chat', reservation = null, planCfg = null, carrier = null, excludeMessageId = null, searchOutcome = null }) {
   const abortController = new AbortController();
   let clientClosed = false;
   req.on('close', () => { clientClosed = true; try { abortController.abort(new Error('client closed')); } catch {} });
@@ -1040,8 +1195,16 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
 
   const prefs = replyPrefsPrompt(req.body, req.headers);
   const codeDelivery = codeDeliveryPrompt(userText);
+  // Web-grounded turn (§11): real retrieved sources become structured
+  // context + grounding/citation instructions. Performed ONLY when the
+  // backend actually searched — never faked (§42).
+  const hasWebSources = !!(searchOutcome && searchOutcome.status === 'success' && searchOutcome.sources?.length);
+  const searchContext = hasWebSources ? webSearchService.buildSearchContextBlock(searchOutcome) : '';
   const messages = chatService.buildMessages({
-    systemPrompt: [cfg.system_prompt, prefs, codeDelivery].filter(Boolean).join('\n\n'), memory, ragContext,
+    systemPrompt: [
+      cfg.system_prompt, prefs, codeDelivery,
+      hasWebSources ? webSearchService.GROUNDED_ANSWER_INSTRUCTIONS : '',
+    ].filter(Boolean).join('\n\n'), memory, ragContext, searchContext,
     history: kept, summary, documentContext,
     userText,
     imageDataUrls,
@@ -1125,9 +1288,30 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
     ? [`${documentContext.name}${documentContext.pages ? ` (${documentContext.pages} pages)` : ''}`]
     : [];
 
+  // Web-search provenance (§12/§42): attached only when a real search
+  // attempt happened this turn (success, empty or unavailable — each
+  // is honest information for the UI).
+  const webSearchMeta = (searchOutcome && searchOutcome.status !== 'skipped') ? {
+    performed: !!searchOutcome.performed,
+    mode: searchOutcome.mode === 'manual' ? 'manual' : (searchOutcome.mode === 'agent' ? 'agent' : 'auto'),
+    queries: (searchOutcome.queries || []).slice(0, 5),
+    sources: (searchOutcome.sources || []).slice(0, 12).map(s => ({
+      title: s.title, url: s.url, domain: s.domain,
+      snippet: String(s.snippet || '').slice(0, 300),
+      published_date: s.published_date || null,
+      icon: null,
+    })),
+    result_count: searchOutcome.resultCount || 0,
+    duration_ms: searchOutcome.durationMs || 0,
+    status: searchOutcome.status === 'success' ? 'success'
+      : searchOutcome.status === 'empty' ? 'empty' : 'unavailable',
+    cached: !!searchOutcome.cached,
+  } : null;
+
   const aiMsg = await saveAssistantResult({
     carrier, chatId, content: aiText, model: usedModel, tokens: usageTokens,
     processingMs: Date.now() - startedAt, status: 'completed', sources, provider: aiConfig.provider,
+    webSearch: webSearchMeta,
   });
   chat.updated_at = new Date();
   chat.model = usedModel; // conversation remembers the model for restoration (§31)
@@ -1164,7 +1348,7 @@ async function runAssistantTurn(req, res, { chat, send, startedAt, trackType = '
    this first generation. `content` ALWAYS mirrors the active version
    so context building keeps working unchanged.                     */
 const MAX_RESPONSE_VERSIONS = 10;
-async function saveAssistantResult({ carrier, chatId, content, model, tokens, processingMs, status = 'completed', sources = [], provider = null }) {
+async function saveAssistantResult({ carrier, chatId, content, model, tokens, processingMs, status = 'completed', sources = [], provider = null, webSearch = null }) {
   const version = {
     content, model: model || null, tokens: tokens ?? null,
     created_at: new Date(), processing_ms: processingMs, status,
@@ -1187,6 +1371,11 @@ async function saveAssistantResult({ carrier, chatId, content, model, tokens, pr
     carrier.processing_ms = processingMs;
     carrier.status = status;
     carrier.created_at = new Date();
+    // Web-search provenance follows the ACTIVE answer: regenerating
+    // replaces it with the newest turn's truth (or clears it when the
+    // new answer was not web-grounded) — never stale metadata (§42).
+    carrier.web_search = webSearch || null;
+    carrier.markModified?.('web_search');
     await carrier.save();
     return carrier;
   }
@@ -1194,6 +1383,7 @@ async function saveAssistantResult({ carrier, chatId, content, model, tokens, pr
     chat_id: chatId, role: 'assistant', content,
     model: version.model, provider, tokens: version.tokens,
     processing_ms: processingMs, status, sources,
+    web_search: webSearch || null,
     versions: [version], active_version: 0,
   });
 }
@@ -1329,14 +1519,23 @@ async function handleChatMessageTurn(req, res, { chat = null, isNew = false }) {
     }
   }
 
+  /* Conversation mode (§30): chat | web_search | agent. An EXPLICIT
+     'web_search' mode is Pro-only — resolved SERVER-SIDE before any
+     conversation/usage side effects so an unentitled request never
+     reaches LangSearch nor consumes allowance (§2). Invalid/omitted
+     modes never silently flip an existing conversation's mode.     */
+  const requestedMode = CHAT_MODES.includes(req.body?.mode) ? req.body.mode : null;
+  const effectiveMode = requestedMode || chat?.mode || 'chat';
+  const { trigger } = await resolveSearchTrigger(req, res, { mode: effectiveMode, plan: req._plan });
+  if (requestedMode === 'web_search' && trigger === null) return; // 403 already sent
+
   /* Lazy creation (§3) happens ONLY after every pre-AI validation has
      passed — a rejected request (bad file, flagged text) must never
      leave an empty conversation behind. */
   if (isNew && !chat) {
-    const mode = ['chat', 'agent'].includes(req.body?.mode) ? req.body.mode : 'chat';
     for (let attempt = 0; attempt < 3 && !chat; attempt++) {
       try {
-        chat = await Chat.create({ user_id: req.user.id, title: 'New Chat', conversation_id: newConversationId(), mode });
+        chat = await Chat.create({ user_id: req.user.id, title: 'New Chat', conversation_id: newConversationId(), mode: effectiveMode });
       } catch (err) {
         // Duplicate conversation_id — regenerate and retry (astronomically rare)
         if (err?.code !== 11000) throw err;
@@ -1377,10 +1576,10 @@ async function handleChatMessageTurn(req, res, { chat = null, isNew = false }) {
     });
   }
 
-  // Mode persistence (§31/§32): whitelisted, only 'chat' today — the
-  // field exists so the future Agent mode opens without re-architecting.
-  const mode = ['chat', 'agent'].includes(req.body?.mode) ? req.body.mode : null;
-  if (mode && mode !== chat.mode) chat.mode = mode;
+  // Mode persistence (§31/§32): a VALID, explicitly-sent mode updates
+  // the conversation ('chat' | 'web_search' | 'agent'); omitted or
+  // invalid modes leave the conversation's persisted mode untouched.
+  if (requestedMode && requestedMode !== chat.mode) chat.mode = requestedMode;
 
   const userMsg = await Message.create({
     chat_id: chatId, role: 'user', content,
@@ -1400,7 +1599,21 @@ async function handleChatMessageTurn(req, res, { chat = null, isNew = false }) {
   await chat.save();
 
   const trackType = prepared.messageType === 'image' ? 'image' : (prepared.messageType === 'document' ? 'document' : 'chat');
-  await runAssistantTurn(req, res, { chat, send, startedAt: Date.now(), trackType, reservation, planCfg: req._planCfg });
+
+  /* Web Search pipeline (§7) — runs AFTER the user message is saved
+     (so the decision/optimizer see prior turns) and BEFORE the model
+     call. Live progress streams to the client; the outcome grounds
+     the answer and is persisted on it (§11/§12). Auto mode may skip
+     (no search needed) with zero side effects.                    */
+  let searchOutcome = null;
+  if (trigger) {
+    const history = await recentTurnHistory(chatId, String(userMsg._id));
+    searchOutcome = await runTurnSearch(req, res, {
+      send, chat, userText: content || userMsg.content || '', history, trigger, plan: req._plan,
+    });
+  }
+
+  await runAssistantTurn(req, res, { chat, send, startedAt: Date.now(), trackType, reservation, planCfg: req._planCfg, searchOutcome });
 }
 
 /* Shared pre-turn checks for message endpoints (plan status + burst
@@ -1486,6 +1699,19 @@ app.post('/api/chats/:id/messages/stream', authGuard, uploadChatFields, async (r
    • Mid-conversation regenerate → everything after that turn is
      superseded (branch reset), a fresh answer is generated.        */
 async function handleRegenerate(req, res, { chat, targetUserMsg }) {
+  // Web Search entitlement for the conversation's persisted mode (§30):
+  // a 'web_search' conversation re-searches on regenerate ONLY while
+  // the account still holds the entitlement — otherwise the turn
+  // degrades to a normal chat answer (no mid-stream failure).
+  let searchTrigger = null;
+  if (chat.mode === 'web_search') {
+    if (await webSearchEntitled(req._plan)) searchTrigger = 'manual';
+  } else if (chat.mode === 'agent' && (await webSearchEntitled(req._plan))) {
+    searchTrigger = 'agent';
+  } else if (cfg.web_search_enabled && cfg.web_search_auto_enabled && (await webSearchEntitled(req._plan))) {
+    searchTrigger = 'auto';
+  }
+
   // Usage reservation FIRST — a reached daily limit must never mutate
   // the visible conversation (the old answer stays exactly as it was).
   const reservation = await reserveChatUsage(req, res);
@@ -1530,6 +1756,11 @@ async function handleRegenerate(req, res, { chat, targetUserMsg }) {
     chat, send, startedAt: Date.now(), trackType: 'regenerate',
     reservation, planCfg: req._planCfg, carrier,
     excludeMessageId: carrier?._id || null,
+    searchOutcome: await (searchTrigger ? runTurnSearch(req, res, {
+      send, chat, userText: targetUserMsg.content || '',
+      history: await recentTurnHistory(String(chat._id), String(targetUserMsg._id)),
+      trigger: searchTrigger, plan: req._plan,
+    }) : Promise.resolve(null)),
   });
 }
 
@@ -1616,6 +1847,13 @@ app.post('/api/chats/:id/messages', authGuard, uploadChatFields, async (req, res
   if (!(await preflightTurn(req, res, { withUploadLimiter: true }))) { cleanupUploads(req); return; }
   const plan = req._plan, planCfg = req._planCfg;
 
+  /* Web Search mode gate (§2) — BEFORE any side effects, same as the
+     streaming path: an unentitled manual search never reaches
+     LangSearch and never consumes allowance. */
+  const requestedMode = CHAT_MODES.includes(req.body?.mode) ? req.body.mode : null;
+  const { trigger: searchTrigger } = await resolveSearchTrigger(req, res, { mode: requestedMode || 'chat', plan });
+  if (requestedMode === 'web_search' && searchTrigger === null) return; // 403 already sent
+
   let reservation = null;
   try {
     const chat = await resolveChatParam(req, res);
@@ -1655,6 +1893,23 @@ app.post('/api/chats/:id/messages', authGuard, uploadChatFields, async (req, res
       const title = content ? content.slice(0, 60) : (prepared.metas[0]?.name || 'New Chat');
       if (title && title !== chat.title) { chat.title = title; }
     }
+    // Mode persistence (§30) — same rules as the streaming path.
+    if (requestedMode && requestedMode !== chat.mode) chat.mode = requestedMode;
+
+    /* Web Search pipeline (§7) — synchronous variant of the SSE flow.
+       Skipped decisions produce no events and no log rows.          */
+    let searchOutcome = null;
+    if (searchTrigger) {
+      searchOutcome = await webSearchService.runWebSearch({
+        userText: content || userMsg.content || '',
+        userId: req.user.id,
+        history: await recentTurnHistory(chatId, String(userMsg._id)),
+        trigger: searchTrigger,
+      });
+      if (searchOutcome.status !== 'skipped') {
+        await logSearchAttempt({ req, chat, userText: content || userMsg.content || '', outcome: searchOutcome, plan });
+      }
+    }
 
     // Context via AI Core (plan-aware bounded window + budget + rolling summary)
     const planContextMult = planCfg?.contextMessages ? Math.min(8, Math.max(1, planCfg.contextMessages / 10)) : 1;
@@ -1690,8 +1945,14 @@ app.post('/api/chats/:id/messages', authGuard, uploadChatFields, async (req, res
           maxTokens: cfg.max_tokens, temperature: cfg.temperature,
         });
       } else {
+        const hasWebSources = !!(searchOutcome && searchOutcome.status === 'success' && searchOutcome.sources?.length);
         const messages = chatService.buildMessages({
-          systemPrompt: cfg.system_prompt, memory, ragContext: ragCtx,
+          systemPrompt: [
+            cfg.system_prompt,
+            hasWebSources ? webSearchService.GROUNDED_ANSWER_INSTRUCTIONS : '',
+          ].filter(Boolean).join('\n\n'),
+          memory, ragContext: ragCtx,
+          searchContext: hasWebSources ? webSearchService.buildSearchContextBlock(searchOutcome) : '',
           history: kept, summary, documentContext,
           userText: content || '',
         });
@@ -1716,9 +1977,26 @@ app.post('/api/chats/:id/messages', authGuard, uploadChatFields, async (req, res
       ? [`${documentContext.name}${documentContext.pages ? ` (${documentContext.pages} pages)` : ''}`]
       : [];
 
+    const webSearchMeta = (searchOutcome && searchOutcome.status !== 'skipped') ? {
+      performed: !!searchOutcome.performed,
+      mode: searchOutcome.mode === 'manual' ? 'manual' : (searchOutcome.mode === 'agent' ? 'agent' : 'auto'),
+      queries: (searchOutcome.queries || []).slice(0, 5),
+      sources: (searchOutcome.sources || []).slice(0, 12).map(s => ({
+        title: s.title, url: s.url, domain: s.domain,
+        snippet: String(s.snippet || '').slice(0, 300),
+        published_date: s.published_date || null, icon: null,
+      })),
+      result_count: searchOutcome.resultCount || 0,
+      duration_ms: searchOutcome.durationMs || 0,
+      status: searchOutcome.status === 'success' ? 'success'
+        : searchOutcome.status === 'empty' ? 'empty' : 'unavailable',
+      cached: !!searchOutcome.cached,
+    } : null;
+
     const aiMsg = await saveAssistantResult({
       chatId, content: aiText, model: result.model, tokens: result.tokens,
       processingMs: Date.now() - startTime, status: 'completed', sources, provider: aiConfig.provider,
+      webSearch: webSearchMeta,
     });
     chat.updated_at = new Date();
     chat.model = result.model;
@@ -1913,6 +2191,21 @@ app.get('/api/stats', authGuard, async (req, res) => {
   } catch { res.json({ total_chats: 0, total_messages: 0, total_tokens: 0 }); }
 });
 
+/* ── WEB SEARCH HISTORY (user-facing, §21) ────────────────────
+   The caller's OWN search metadata only — queries, trigger, status
+   and source domains. Never includes other users' rows and never
+   the retrieved webpage contents.                              */
+app.get('/api/web-search/history', authGuard, async (req, res) => {
+  try {
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const rows = await SearchLog.find({ user_id: req.user.id })
+      .sort({ created_at: -1 }).limit(limit)
+      .select('query queries trigger result_count source_domains duration_ms status cached created_at')
+      .lean();
+    res.json({ searches: rows.map(r => ({ ...r, _id: undefined, id: r._id?.toString() })) });
+  } catch { res.json({ searches: [] }); }
+});
+
 app.get('/api/usage', authGuard, async (req, res) => {
   try {
     const uid = new mongoose.Types.ObjectId(req.user.id);
@@ -1969,7 +2262,7 @@ const adminRouter = require('./routes/admin');
 app.use('/api/admin', adminRouter);
 
 /* ── HEALTH ──────────────────────────────────────────────────── */
-app.get('/api/health', (_, res) => res.json({ status: 'ok', version: '7.1.0', db: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected', uptime: process.uptime(), memory: process.memoryUsage().rss, timestamp: new Date().toISOString() }));
+app.get('/api/health', (_, res) => res.json({ status: 'ok', version: require('./package.json').version, db: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected', uptime: process.uptime(), memory: process.memoryUsage().rss, timestamp: new Date().toISOString() }));
 
 /* ══════════════════════════════════════════════════════════════
    SOCKET.IO

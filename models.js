@@ -46,10 +46,11 @@ const chatSchema = new Schema({
      created before this field exist safely until the idempotent
      startup migration backfills them (see app.js).               */
   conversation_id: { type: String, default: null },
-  /* Conversation mode: 'chat' today, 'agent' reserved for the
-     upcoming Agent mode (tool calls, artifacts, execution logs).
+  /* Conversation mode: 'chat' (default), 'web_search' (explicit web
+     research — Pro feature) and 'agent' reserved for the upcoming
+     Agent mode (tool calls, artifacts, execution logs).
      Restored on load so the composer reopens in the right mode.   */
-  mode:  { type: String, enum: ['chat', 'agent'], default: 'chat' },
+  mode:  { type: String, enum: ['chat', 'web_search', 'agent'], default: 'chat' },
   /* Model that produced the latest assistant response (display +
      restoration purposes — the backend always picks the real model). */
   model: { type: String, default: null },
@@ -123,6 +124,30 @@ const messageSchema = new Schema({
   status:        { type: String, enum: ['completed', 'cancelled', 'failed'], default: 'completed' },
   // surfaced sources (only when the backend actually knows them)
   sources:       { type: [String], default: [] },
+  /* ── Web-grounded answer provenance (Web Search §12/§42) ────
+     Populated ONLY when the backend actually performed a real web
+     search for this turn. All URLs originate from the search
+     provider — never fabricated. Null for ordinary turns.       */
+  web_search: {
+    type: {
+      performed:    { type: Boolean, default: false },
+      mode:         { type: String, enum: ['auto', 'manual', 'agent'], default: 'auto' },
+      queries:      { type: [String], default: [] },        // the ACTUAL queries sent
+      sources:      { type: [{
+        title:          { type: String, default: '' },
+        url:            { type: String, required: true },
+        domain:         { type: String, default: '' },
+        snippet:        { type: String, default: '' },
+        published_date: { type: String, default: null },   // as returned by the provider
+        icon:           { type: String, default: null },    // provider-provided site icon or null
+      }], default: [] },
+      result_count: { type: Number, default: 0 },
+      duration_ms:  { type: Number, default: 0 },
+      status:       { type: String, enum: ['success', 'empty', 'unavailable'], default: 'success' },
+      cached:       { type: Boolean, default: false },
+    },
+    default: null,
+  },
 }, { timestamps: { createdAt: 'created_at', updatedAt: false } });
 
 messageSchema.index({ chat_id: 1, created_at: 1 });
@@ -340,6 +365,7 @@ const planConfigSchema = new Schema({
     agentAccess:         { type: Boolean, default: false },
     priorityProcessing:  { type: Boolean, default: false },
     advancedTools:       { type: Boolean, default: true },
+    webSearch:           { type: Boolean, default: false }, // PRO-only (Web Search §2)
   },
   is_active: { type: Boolean, default: true },
   sort_order: { type: Number, default: 0 },
@@ -389,6 +415,39 @@ planRequestSchema.index({ status: 1, created_at: -1 });
 planRequestSchema.index({ user_id: 1, status: 1 });
 planRequestSchema.index({ requested_plan: 1, created_at: -1 });
 
+/* ── SEARCH LOG (Web Search metadata §21) ───────────────────────
+   One row per REAL search attempt (success, empty or error).
+   Metadata only — no full webpage content is ever stored here
+   (privacy + storage cost, §21). The query itself is kept for the
+   SuperAdmin "most searched" analytics and for the user's own
+   history view; users can only ever read their own rows.         */
+const searchLogSchema = new Schema({
+  user_id:         { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  chat_id:         { type: Schema.Types.ObjectId, ref: 'Chat', default: null },
+  conversation_id: { type: String, default: null },            // public UUID when known
+  query:           { type: String, required: true, maxlength: 1000 },
+  queries:         { type: [String], default: [] },            // optimized queries actually executed
+  // What triggered the search: automatic decision, explicit user mode, or the Agent tool
+  trigger:         { type: String, enum: ['auto', 'manual', 'agent'], required: true },
+  plan:            { type: String, enum: ['free', 'plus', 'pro'], default: 'free' },
+  result_count:    { type: Number, default: 0 },
+  source_domains:  { type: [String], default: [] },
+  duration_ms:     { type: Number, default: 0 },
+  status:          { type: String, enum: ['success', 'empty', 'error', 'rate_limited'], default: 'success', index: true },
+  error_code:      { type: String, default: null },            // LANGSEARCH_TIMEOUT, LANGSEARCH_AUTH, …
+  cached:          { type: Boolean, default: false },
+  usage: {         // provider-reported token usage when available
+    input_tokens:  { type: Number, default: null },
+    output_tokens: { type: Number, default: null },
+  },
+}, { timestamps: { createdAt: 'created_at', updatedAt: false } });
+
+searchLogSchema.index({ created_at: -1 });
+searchLogSchema.index({ user_id: 1, created_at: -1 });
+searchLogSchema.index({ trigger: 1, created_at: -1 });
+searchLogSchema.index({ plan: 1, created_at: -1 });
+searchLogSchema.index({ status: 1, created_at: -1 });
+
 /* ── FLAGGED CONTENT ──────────────────────────────────────────── */
 const flaggedContentSchema = new Schema({
   message_id:   { type: Schema.Types.ObjectId, ref: 'Message', default: null },
@@ -427,4 +486,5 @@ module.exports = {
   UsageDaily:        mongoose.model('UsageDaily',        usageDailySchema),
   PlanRequest:       mongoose.model('PlanRequest',       planRequestSchema),
   FlaggedContent:    mongoose.model('FlaggedContent',    flaggedContentSchema),
+  SearchLog:         mongoose.model('SearchLog',         searchLogSchema),
 };

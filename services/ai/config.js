@@ -38,6 +38,20 @@ const config = {
   ttsVoice: env('GROQ_TTS_VOICE', 'tara'),
   ttsFormat: env('GROQ_TTS_FORMAT', 'wav'),
 
+  /* ── Web Search provider (LangSearch — Web Search §4) ───────── */
+  /* The API key NEVER leaves the backend env (§3). Implemented
+     against the official current API: POST /v1/web-search with
+     query / count / freshness / includeDomains / excludeDomains /
+     contents.text — see docs.langsearch.com.                     */
+  langSearch: {
+    apiKey:   env('LANGSEARCH_API_KEY'),
+    endpoint: env('LANGSEARCH_ENDPOINT', 'https://api.langsearch.com/v1/web-search'),
+    timeoutMs:        num('LANGSEARCH_TIMEOUT_MS', 12000),
+    defaultCount:     Math.min(50, Math.max(1, num('LANGSEARCH_COUNT', 8))),
+    maxCount:         50,
+    textMaxCharacters: num('LANGSEARCH_TEXT_MAX_CHARS', 3200), // per-result webpage text cap
+  },
+
   /* ── Context management (§5) ──────────────────────────────── */
   context: {
     maxMessages:      num('AI_CONTEXT_MAX_MESSAGES', 20),   // window of recent messages
@@ -66,6 +80,7 @@ const config = {
     upload:   { limit: num('RL_UPLOAD_LIMIT', 12),  windowMs: num('RL_UPLOAD_WINDOW_MS', 5 * 60 * 1000) },
     stt:      { limit: num('RL_STT_LIMIT', 20),     windowMs: num('RL_STT_WINDOW_MS', 5 * 60 * 1000) },
     tts:      { limit: num('RL_TTS_LIMIT', 30),     windowMs: num('RL_TTS_WINDOW_MS', 5 * 60 * 1000) },
+    search:   { limit: num('RL_SEARCH_LIMIT', 24),  windowMs: num('RL_SEARCH_WINDOW_MS', 5 * 60 * 1000) },
   },
 
   /* ── Supported types (server-side truth — §19) ────────────── */
