@@ -41,7 +41,7 @@ const DEFAULTS = [
     burst_multiplier: 1,
     features: {
       chatAccess: true, voiceAccess: true, imageGeneration: true,
-      documentAnalysis: true, advancedContext: false, agentAccess: false,
+      documentAnalysis: true, advancedContext: false, agentAccess: true,
       priorityProcessing: false, advancedTools: true,
       webSearch: false,
     },
@@ -57,7 +57,7 @@ const DEFAULTS = [
     burst_multiplier: 2,
     features: {
       chatAccess: true, voiceAccess: true, imageGeneration: true,
-      documentAnalysis: true, advancedContext: true, agentAccess: false,
+      documentAnalysis: true, advancedContext: true, agentAccess: true,
       priorityProcessing: true, advancedTools: true,
       webSearch: false,
     },
@@ -73,7 +73,7 @@ const DEFAULTS = [
     burst_multiplier: 4,
     features: {
       chatAccess: true, voiceAccess: true, imageGeneration: true,
-      documentAnalysis: true, advancedContext: true, agentAccess: false,
+      documentAnalysis: true, advancedContext: true, agentAccess: true,
       priorityProcessing: true, advancedTools: true,
       webSearch: true,
     },

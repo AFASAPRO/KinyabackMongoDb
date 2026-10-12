@@ -119,6 +119,11 @@ const messageSchema = new Schema({
      earlier turn. Hidden from the active conversation and context
      but preserved in the database for recovery/audit (§18).     */
   superseded:    { type: Boolean, default: false },
+  /* Agent V1 (§26): when this message belongs to an Agent task
+     (user prompt or final task result), the owning AgentTask id.
+     The UI renders a live task card instead of a plain bubble
+     for these messages. Null for all normal chat messages.      */
+  agent_task_id: { type: String, default: null },
   // AI provenance (assistant messages)
   model:         { type: String, default: null },
   provider:      { type: String, default: null },
@@ -469,6 +474,80 @@ const flaggedContentSchema = new Schema({
 flaggedContentSchema.index({ reviewed: 1 });
 flaggedContentSchema.index({ status: 1, created_at: -1 });
 
+/* ── AGENT TASK (Agent V1, §14) ─────────────────────────────────
+   One document per autonomous task run by the Agent execution
+   worker. `task_ref` is the public URL id (/agent/{task_ref}),
+   generated server-side with crypto.randomUUID — never client-
+   side. The workspace lives at {workspaceRoot}/{taskId} and is
+   enforced by services/agent/sandbox.js.                       */
+const agentTaskSchema = new Schema({
+  user_id:         { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  conversation_id: { type: Schema.Types.ObjectId, ref: 'Chat', default: null }, // Chat with mode 'agent'
+  task_ref:        { type: String, default: null },           // public UUID reference
+  title:           { type: String, default: 'Agent task', maxlength: 255 },
+  prompt:          { type: String, required: true },
+  /* queued | planning | running | waiting_for_confirmation | paused |
+     completed | failed | cancelled (§14)                          */
+  status:          { type: String, enum: ['queued', 'planning', 'running', 'waiting_for_confirmation', 'paused', 'completed', 'failed', 'cancelled'], default: 'queued', index: true },
+  mode:            { type: String, default: 'agent' },
+  /* Concise high-level plan (§16) — steps only, never chain-of-thought. */
+  plan:            { type: [{ title: String, status: { type: String, enum: ['pending', 'in_progress', 'done', 'skipped', 'failed'], default: 'pending' } }], default: [] },
+  current_step:    { type: Number, default: 0 },
+  workspace_id:    { type: String, default: null },           // workspace dir name (== _id)
+  permissions:     { type: Object, default: null },           // granted permission map
+  error:           { type: String, default: null },
+  error_code:      { type: String, default: null },
+  result:          { type: String, default: null },           // final summary (also mirrored to a Message)
+  stats: {
+    steps:         { type: Number, default: 0 },
+    tool_calls:    { type: Number, default: 0 },
+    commands_run:  { type: Number, default: 0 },
+    files_changed: { type: Number, default: 0 },
+    duration_ms:   { type: Number, default: null },
+    tokens:        { type: Number, default: null },
+    model:         { type: String, default: null },
+    retries:       { type: Number, default: 0 },
+  },
+  /* Live preview registration (§24) — only ports verified as
+     LISTENING are ever recorded here. `kept_alive` marks a preview
+     whose dev server survived task completion for inspection.   */
+  preview: {
+    port:          { type: Number, default: null },
+    url_path:      { type: String, default: null },
+    started_at:    { type: Date, default: null },
+    pid:           { type: Number, default: null },
+    pids:          { type: [Number], default: [] },   // owning process groups
+    kept_alive:    { type: Boolean, default: false },
+  },
+  started_at:      { type: Date, default: null },
+  completed_at:    { type: Date, default: null },
+}, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
+
+agentTaskSchema.index({ task_ref: 1 }, { unique: true, sparse: true });
+agentTaskSchema.index({ user_id: 1, created_at: -1 });
+agentTaskSchema.index({ status: 1, created_at: -1 });
+
+/* ── AGENT EVENT (§15) ──────────────────────────────────────────
+   Append-only execution event stream — one document per real
+   event (tool started, terminal output chunk, plan update…).
+   The frontend restores the full timeline after a refresh and
+   catches up after reconnects using `after` pagination.        */
+const agentEventSchema = new Schema({
+  task_id:  { type: Schema.Types.ObjectId, ref: 'AgentTask', required: true },
+  user_id:  { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  /* task.created/started/planning/plan.updated · tool.started/
+     completed/failed · file.changed · terminal.started/output/
+     completed/blocked · ports.detected · preview.ready/stopped ·
+     verification.started/completed · confirmation.requested/
+     resolved · task.completed/failed/cancelled (§15)           */
+  type:     { type: String, required: true, index: true },
+  data:     { type: Schema.Types.Mixed, default: {} },
+  seq:      { type: Number, default: 0 },                     // per-task sequence for gap-free catch-up
+}, { timestamps: { createdAt: 'created_at', updatedAt: false } });
+
+agentEventSchema.index({ task_id: 1, seq: 1 });
+agentEventSchema.index({ task_id: 1, created_at: 1 });
+
 /* ── EXPORTS ──────────────────────────────────────────────────── */
 module.exports = {
   User:              mongoose.model('User',              userSchema),
@@ -491,4 +570,6 @@ module.exports = {
   PlanRequest:       mongoose.model('PlanRequest',       planRequestSchema),
   FlaggedContent:    mongoose.model('FlaggedContent',    flaggedContentSchema),
   SearchLog:         mongoose.model('SearchLog',         searchLogSchema),
+  AgentTask:         mongoose.model('AgentTask',         agentTaskSchema),
+  AgentEvent:        mongoose.model('AgentEvent',        agentEventSchema),
 };

@@ -2217,6 +2217,15 @@ app.get('/api/usage', authGuard, async (req, res) => {
    POST /api/subscription/ack-plan
 ════════════════════════════════════════════════════════════ */
 app.use('/api', require('./routes/subscription'));
+
+/* ════════════════════════════════════════════════════════════
+   AGENT V1 — /api/agent/*
+   Real autonomous execution: task creation, workspace tools,
+   realtime event stream (Socket.IO user rooms), preview proxy.
+   All routes are authGuard-protected inside routes/agent.js and
+   entitlement is resolved server-side (agentAccess plan flag).
+══════════════════════════════════════════════════════════════ */
+app.use('/api', require('./routes/agent'));
 /* ══════════════════════════════════════════════════════════════
    SUPERADMIN API (v2) — implemented in routes/admin.js
    One administrative role: super_admin. Every endpoint verifies
@@ -2257,6 +2266,12 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: corsOrigin, credentials: true } });
 app.set('io', io);
 attachIo(io); // services/activity.js emits live events through this
+
+/* Agent V1 realtime: the orchestrator pushes task events through the
+   SAME Socket.IO server into each user's room (user_<id>) — no second
+   realtime infrastructure, reconnection handled by the existing client. */
+const agentOrchestrator = require('./services/agent/orchestrator');
+agentOrchestrator.attachAgentIo(io);
 
 io.use((socket, next) => {
   const t = socket.handshake.auth?.token;
@@ -2374,9 +2389,30 @@ connectDB().then(async () => {
     const n = await migrateConversationIds();
     if (n) console.log(`✅ Backfilled ${n} conversation(s) with public conversation_id`);
   } catch (err) { console.error('[Migration] conversation_id backfill failed:', err.message); }
+  // ── Agent V1 launch migration ────────────────────────────────
+  // The agentAccess plan flag shipped as `false` on every plan before
+  // Agent V1 existed. This one-time, idempotent migration enables it on
+  // all plans so the Agent mode selector works for existing accounts.
+  // Admins can still disable it per-plan afterwards via the Superadmin
+  // plans UI (this migration only runs where the flag is still false).
+  try {
+    const { PlanConfig } = require('./models');
+    const ag = await PlanConfig.updateMany(
+      { 'features.agentAccess': { $ne: true } },
+      { $set: { 'features.agentAccess': true } }
+    );
+    if (ag.modifiedCount) console.log(`✅ Enabled Agent access on ${ag.modifiedCount} plan(s) (Agent V1 launch)`);
+  } catch (err) { console.error('[Agent] plan flag migration failed:', err.message); }
+  // Agent boot recovery (§30): tasks interrupted by a restart are
+  // honestly marked failed — never left in a phantom running state.
+  try { await agentOrchestrator.recoverOnBoot(); } catch (err) { console.error('[Agent] boot recovery failed:', err.message); }
+  // Idle workspace cleanup (§12): hourly sweep of stale task dirs.
+  setInterval(() => { agentOrchestrator.cleanupIdleWorkspaces().catch(() => {}) }, 60 * 60 * 1000).unref();
   server.listen(PORT, () => {
     const pkg = require('./package.json');
     console.log(`\n✅ KinyaBot v${pkg.version} (MongoDB) → http://localhost:${PORT}`);
-    console.log(`   Superadmin  → http://localhost:5173/admin\n`);
+    console.log(`   Superadmin  → http://localhost:5173/admin`);
+    const agentConfig = require('./services/agent/config');
+    console.log(`   Agent V1    → ${agentConfig.enabled ? `enabled (${agentConfig.executionMode} execution)` : 'disabled by configuration'}\n`);
   });
 });

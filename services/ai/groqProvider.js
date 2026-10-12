@@ -9,6 +9,9 @@
  * Capabilities:
  *   chatComplete()      – non-streaming text completion
  *   chatCompleteStream()– streaming text completion (async iterator)
+ *   chatCompleteWithTools() – AGENT: native function/tool calling,
+ *                         returns the raw assistant message with
+ *                         tool_calls for the Agent execution loop.
  *   visionComplete()    – multimodal (text + image) completion
  *   transcribeAudio()   – speech-to-text (Whisper)
  *   synthesizeSpeech()  – text-to-speech (PlayAI TTS)
@@ -92,6 +95,41 @@ async function chatCompleteStream({ messages, model, maxTokens = 2048, temperatu
           for await (const chunk of stream) yield chunk
         } catch (err) { throw normalizeError(err) }
       },
+    }
+  } catch (err) { throw normalizeError(err) } finally { cleanup() }
+}
+
+/* ── Tool-calling completion (Agent V1, §20) ────────────────────
+   Uses the provider's NATIVE structured tool-calling (OpenAI-
+   compatible `tools` + `tool_choice` on Groq). The Agent loop
+   never parses natural-language command text — every tool
+   request arrives as a structured tool_call object.            */
+async function chatCompleteWithTools({ messages, tools, toolChoice = 'auto', model, maxTokens = 2048, temperature = 0.4, signal }) {
+  const { signal: timed, cleanup } = withTimeout(signal, config.limits.chatTimeoutMs, 'Agent tool-calling')
+  try {
+    const payload = {
+      model: model || config.models.chat,
+      messages,
+      max_tokens: maxTokens,
+      temperature,
+    }
+    if (tools?.length) {
+      payload.tools = tools
+      payload.tool_choice = toolChoice
+    }
+    const completion = await getClient().chat.completions.create(payload, { signal: timed })
+    const choice = completion.choices?.[0]
+    const message = choice?.message
+    if (!message) { const e = new Error('Empty AI response'); e.code = 'EMPTY_AI_RESPONSE'; throw e }
+    return {
+      message: {
+        role: 'assistant',
+        content: message.content ?? '',
+        tool_calls: message.tool_calls || [],
+      },
+      finish_reason: choice?.finish_reason || null,
+      model: completion.model || model || config.models.chat,
+      tokens: completion.usage?.total_tokens || null,
     }
   } catch (err) { throw normalizeError(err) } finally { cleanup() }
 }
@@ -202,6 +240,7 @@ module.exports = {
   getClient,
   chatComplete,
   chatCompleteStream,
+  chatCompleteWithTools,
   visionComplete,
   transcribeAudio,
   synthesizeSpeech,
