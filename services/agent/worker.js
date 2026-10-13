@@ -209,6 +209,10 @@ function buildToolContext() {
     taskId: task.taskId,
     permissions: task.permissions,
     limits,
+    /* V1.2 §10: server-resolved plan entitlements — the web_search
+       tool refuses when the plan lacks it (the model cannot grant
+       itself access through the prompt). */
+    entitlements: task.entitlements || { webSearch: false, webSearchEnabled: true },
     emit,
     runCommand: executeCommand,
     requireConfirmation,
@@ -245,7 +249,7 @@ async function runTask(t, l) {
   /* 3 ─ EXECUTION LOOP: select tool → execute → observe → evaluate. */
   const messages = [
     { role: 'system', content: agentProviderModule.AGENT_SYSTEM },
-    { role: 'user', content: buildTaskMessage(task.prompt, detection, plan.steps) },
+    buildFirstUserMessage(task.prompt, detection, plan.steps),
   ]
 
   let finalAnswer = null
@@ -448,8 +452,45 @@ function enforceTaskTimeout(startedAt) {
 function buildTaskMessage(prompt, detection, planSteps) {
   let msg = `TASK: ${prompt}\n\nExecution plan:\n${planSteps.map((s, i) => `${i + 1}. ${s}`).join('\n')}`
   if (detection) msg += `\n\nExisting project detected in the workspace:\n${JSON.stringify(detection).slice(0, 2000)}`
+  /* V1.2 §9: the workspace holds a project the USER uploaded — the
+     task is a MODIFICATION request. Say so explicitly so the agent
+     edits the existing project instead of rebuilding it.    */
+  if (task.sourceUpload) {
+    const su = task.sourceUpload
+    const mb = su.bytes ? ` (~${Math.max(1, Math.round(su.bytes / 1048576))} MB)` : ''
+    msg += `\n\nIMPORTED PROJECT (user upload: "${su.name}", ${su.files} files${mb}${su.rootDir ? `, wrapper folder "${su.rootDir}/"` : ''})`
+    if (su.skippedSecrets > 0) msg += `\nNOTE: ${su.skippedSecrets} secret file(s) (e.g. .env) were SKIPPED from the archive for safety — the project must not depend on them; never recreate credential files.`
+    msg += `\nThis is an EXISTING project: inspect it first (detect_project, list_files, read key files), identify its framework/structure, then make the requested changes by EDITING the existing files. Do NOT rebuild the project from scratch or discard untouched files.`
+  }
+  /* V1.2 §8: reference images are attached to the first user message
+     as real image content parts (built in buildFirstUserMessage) —
+     this text block tells the model HOW to use them. */
+  if ((task.referenceImages || []).length) {
+    msg += `\n\nREFERENCE IMAGES: ${task.referenceImages.length} user-uploaded image(s) are attached to this message. Inspect them and use them as the visual reference for layout, spacing, colors, typography, components and overall style. Build FUNCTIONAL code that reproduces the design — do not merely embed the image itself as the page.`
+  }
   msg += `\n\nBegin executing the plan now using tools.`
   return msg
+}
+
+/* V1.2 §8: build the first user message — multimodal (text + real
+   image parts) when reference images exist. Images are read from
+   disk HERE (in the worker) so base64 payloads never travel over
+   IPC twice; the vision model env reaches us via workerBridge. */
+function buildFirstUserMessage(prompt, detection, planSteps) {
+  const text = buildTaskMessage(prompt, detection, planSteps)
+  const images = (task.referenceImages || []).slice(0, 4)
+  if (!images.length) return { role: 'user', content: text }
+  const parts = [{ type: 'text', text }]
+  for (const img of images) {
+    try {
+      const buf = require('fs').readFileSync(img.path)
+      parts.push({
+        type: 'image_url',
+        image_url: { url: `data:${img.mime || 'image/png'};base64,${buf.toString('base64')}` },
+      })
+    } catch {}
+  }
+  return { role: 'user', content: parts }
 }
 
 /* ── Lifecycle ───────────────────────────────────────────────── */

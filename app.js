@@ -2218,6 +2218,12 @@ app.get('/api/usage', authGuard, async (req, res) => {
 ════════════════════════════════════════════════════════════ */
 app.use('/api', require('./routes/subscription'));
 
+/* ═══ V1.2 §12 — USER NOTIFICATIONS + WEB PUSH ═════════════════
+   Persistent per-user notifications (history, read state, deep
+   links, dedupe) + Web Push subscription management. Mounted on
+   /api like every other public surface; all routes JWT-guarded. */
+app.use('/api', require('./routes/notifications'));
+
 /* ════════════════════════════════════════════════════════════
    AGENT V1 — /api/agent/*
    Real autonomous execution: task creation, workspace tools,
@@ -2254,8 +2260,29 @@ app.use('/api/admin', (req, res, next) => {
 const adminRouter = require('./routes/admin');
 app.use('/api/admin', adminRouter);
 
+
 /* ── HEALTH ──────────────────────────────────────────────────── */
 app.get('/api/health', (_, res) => res.json({ status: 'ok', version: require('./package.json').version, db: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected', uptime: process.uptime(), memory: process.memoryUsage().rss, timestamp: new Date().toISOString() }));
+
+/* ═══ V1.2 §2 — JSON 404 CATCH-ALL FOR UNMATCHED /api ROUTES ═══
+   Root-cause fix for the ZIP-download 404 diagnosis: an unmatched
+   API path previously fell through to Express's default HTML 404
+   page — which the blob-based download handler could not parse, so
+   users saw the raw axios "Request failed with status code 404"
+   with no diagnostics. Now EVERY unmatched /api path returns
+   machine-readable JSON including the path + method, so client
+   error messages stay honest and actionable (and no HTML page can
+   ever be saved as a fake .zip). Registered AFTER every router +
+   the health endpoint — this is the FINAL /api handler.       */
+app.use('/api', (req, res) => {
+  res.status(404).json({
+    error: 'Unknown API endpoint.',
+    code: 'API_NOT_FOUND',
+    method: req.method,
+    path: req.path,
+    hint: 'The backend received the request but has no route for it — check the deployed backend version and the frontend API base URL.',
+  });
+});
 
 /* ══════════════════════════════════════════════════════════════
    SOCKET.IO

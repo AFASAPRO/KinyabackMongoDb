@@ -192,15 +192,17 @@ const notificationSchema = new Schema({
 
 /* ── ADMIN NOTIFICATION (Superadmin control-center feed) ────────
    Generated ONLY from real system events (AI failures, security
-   events, moderation flags, config changes, milestones…).
-   Distinct from `Notification`, which is the user-facing broadcast. */
+   events, moderation flags, config changes, milestones, Agent
+   worker trouble…). Distinct from `Notification`, which is the
+   user-facing broadcast. V1.2 adds the 'agent' category for
+   worker/preview/task-failure events (§13). */
 const adminNotificationSchema = new Schema({
   title:     { type: String, required: true },
   message:   { type: String, required: true },
   // display severity
   type:      { type: String, enum: ['info', 'success', 'warning', 'error', 'critical'], default: 'info' },
   // event domain — used by the notification center filters
-  category:  { type: String, enum: ['system', 'ai', 'security', 'user', 'moderation', 'config', 'usage'], default: 'system' },
+  category:  { type: String, enum: ['system', 'ai', 'security', 'user', 'moderation', 'config', 'usage', 'agent'], default: 'system' },
   read:      { type: Boolean, default: false },
   // deep link path inside the Superadmin app (e.g. '/admin/ai')
   link:      { type: String, default: null },
@@ -252,15 +254,23 @@ securityEventSchema.index({ type: 1, created_at: -1 });
 securityEventSchema.index({ severity: 1, created_at: -1 });
 securityEventSchema.index({ ip: 1, created_at: -1 });
 
-/* ── PUSH SUBSCRIPTION (Superadmin PWA web-push endpoints) ───── */
+/* ── PUSH SUBSCRIPTION (web-push endpoints) ─────────────────────
+   V1.2 (§12): subscriptions are PER-PRINCIPAL — `owner_type`
+   distinguishes Superadmin PWA subscriptions (legacy rows keep
+   working as 'admin') from user subscriptions. `user_id` is set
+   for owner_type 'user' and every send validates ownership.   */
 const pushSubscriptionSchema = new Schema({
   endpoint:   { type: String, required: true, unique: true },
   keys: {
     p256dh: { type: String, required: true },
     auth:   { type: String, required: true },
   },
+  owner_type: { type: String, enum: ['admin', 'user'], default: 'admin' },
+  user_id:    { type: Schema.Types.ObjectId, ref: 'User', default: null },
   user_agent: { type: String, default: null },
 }, { timestamps: { createdAt: 'created_at', updatedAt: false } });
+
+pushSubscriptionSchema.index({ owner_type: 1, user_id: 1 });
 
 /* ── PAGE VIEW ────────────────────────────────────────────────── */
 const pageViewSchema = new Schema({
@@ -510,9 +520,17 @@ const agentTaskSchema = new Schema({
   },
   /* Live preview registration (§24) — only ports verified as
      LISTENING are ever recorded here. `kept_alive` marks a preview
-     whose dev server survived task completion for inspection.   */
+     whose dev server survived task completion for inspection.
+     V1.2 (§3): `mode` distinguishes the two preview kinds —
+       • 'dev'     — a real dev-server process on `port` (frameworks)
+       • 'static'  — workspace files served directly by the API
+                     process (no process to keep alive; HTML/CSS/JS
+                     sites preview reliably). `root` is the detected
+                     project root directory inside the workspace.  */
   preview: {
+    mode:          { type: String, enum: [null, 'dev', 'static'], default: null },
     port:          { type: Number, default: null },
+    root:          { type: String, default: null },
     url_path:      { type: String, default: null },
     started_at:    { type: Date, default: null },
     pid:           { type: Number, default: null },
@@ -521,6 +539,31 @@ const agentTaskSchema = new Schema({
   },
   started_at:      { type: Date, default: null },
   completed_at:    { type: Date, default: null },
+  /* V1.2 (§8): reference images attached at creation — pointers to
+     AgentUpload docs (ownership validated server-side).            */
+  reference_images: [{
+    upload_id:    { type: Schema.Types.ObjectId, ref: 'AgentUpload' },
+    storage_path: { type: String },
+    mime_type:    { type: String },
+    original_name:{ type: String },
+  }],
+  /* V1.2 (§9): the uploaded existing-project archive this task
+     modifies — extraction summary recorded honestly at creation.   */
+  source_upload: {
+    upload_id:    { type: Schema.Types.ObjectId, ref: 'AgentUpload' },
+    name:         { type: String, default: null },
+    files:        { type: Number, default: 0 },
+    bytes:        { type: Number, default: 0 },
+    root_dir:     { type: String, default: null },
+    skipped:      { type: Schema.Types.Mixed, default: null },
+  },
+  /* V1.2 (§10): server-resolved plan entitlements for THIS task —
+     the worker enforces them inside the loop (never trusts the
+     client, never lets the model bypass plan limits).              */
+  entitlements: {
+    webSearch:        { type: Boolean, default: false },
+    webSearchEnabled: { type: Boolean, default: true },
+  },
 }, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
 
 agentTaskSchema.index({ task_ref: 1 }, { unique: true, sparse: true });
@@ -548,6 +591,56 @@ const agentEventSchema = new Schema({
 agentEventSchema.index({ task_id: 1, seq: 1 });
 agentEventSchema.index({ task_id: 1, created_at: 1 });
 
+/* ── AGENT UPLOAD (V1.2 §8/§9) ──────────────────────────────────
+   One document per user-uploaded file destined for an Agent task:
+   reference images (vision input) and existing-project ZIPs.
+   Bytes live under agent-uploads/{user_id}/… — NEVER public; they
+   are only reachable through ownership-checked endpoints.       */
+const agentUploadSchema = new Schema({
+  user_id:        { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  kind:           { type: String, enum: ['reference_image', 'project_zip'], required: true },
+  storage_path:   { type: String, required: true },   // relative to agent-uploads root
+  original_name:  { type: String, default: 'upload' },
+  size_bytes:     { type: Number, default: 0 },
+  mime_type:      { type: String, default: 'application/octet-stream' },
+  /* set once the upload is attached to a task (dedupe/cleanup) */
+  task_id:        { type: Schema.Types.ObjectId, ref: 'AgentTask', default: null },
+  used:           { type: Boolean, default: false },
+}, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
+
+agentUploadSchema.index({ user_id: 1, created_at: -1 });
+agentUploadSchema.index({ user_id: 1, kind: 1, used: 1 });
+
+/* ── USER NOTIFICATION (V1.2 §12) ───────────────────────────────
+   REAL per-user notifications with persistence, read state, deep
+   links and dedupe — the backbone of desktop/mobile push and the
+   in-app notification center. Written only from REAL events
+   (agent task completed/failed/confirmation, …), never synthetic. */
+const userNotificationSchema = new Schema({
+  user_id:    { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  type:       { type: String, enum: ['info', 'success', 'warning', 'error'], default: 'info' },
+  kind:       { type: String, required: true },          // e.g. agent_task_completed
+  title:      { type: String, required: true },
+  message:    { type: String, required: true },
+  /* deep link into the app (e.g. /chat/agent/<task_ref>) */
+  link:       { type: String, default: null },
+  meta:       { type: Schema.Types.Mixed, default: null },
+  read:       { type: Boolean, default: false },
+  dismissed:  { type: Boolean, default: false },
+  /* delivery bookkeeping — what actually happened, honestly */
+  delivery: {
+    inapp:  { type: Boolean, default: false },
+    push:   { type: String, enum: [null, 'sent', 'failed', 'skipped'], default: null },
+  },
+  /* event-level dedupe: identical (user, kind, dedupe_key) rows are
+     upserted, so retried/duplicate events never spam the user.  */
+  dedupe_key: { type: String, default: null },
+}, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
+
+userNotificationSchema.index({ user_id: 1, dismissed: 1, created_at: -1 });
+userNotificationSchema.index({ user_id: 1, read: 1, created_at: -1 });
+userNotificationSchema.index({ user_id: 1, kind: 1, dedupe_key: 1 }, { unique: true, sparse: true });
+
 /* ── EXPORTS ──────────────────────────────────────────────────── */
 module.exports = {
   User:              mongoose.model('User',              userSchema),
@@ -559,6 +652,8 @@ module.exports = {
   AuditLog:          mongoose.model('AuditLog',          auditLogSchema),
   SecurityEvent:     mongoose.model('SecurityEvent',     securityEventSchema),
   PushSubscription:  mongoose.model('PushSubscription',  pushSubscriptionSchema),
+  AgentUpload:       mongoose.model('AgentUpload',       agentUploadSchema),
+  UserNotification:  mongoose.model('UserNotification',  userNotificationSchema),
   PageView:          mongoose.model('PageView',          pageViewSchema),
   SystemLog:         mongoose.model('SystemLog',         systemLogSchema),
   UserMemory:        mongoose.model('UserMemory',        userMemorySchema),

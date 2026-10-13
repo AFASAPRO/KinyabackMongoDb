@@ -19,12 +19,15 @@
  */
 const mongoose = require('mongoose')
 const crypto = require('crypto')
+const pathMod = require('path')
 
 const agentConfig = require('./config')
-const { AgentTask, AgentEvent, Chat, Message } = require('../../models')
+const { AgentTask, AgentEvent, Chat, Message, SecurityEvent } = require('../../models')
 const { recordEvent } = require('./events')
 const bridge = require('./workerBridge')
 const { Workspace } = require('./sandbox')
+const staticPreview = require('./staticPreview')
+const { notifyUser, notifyAdmins } = require('../notify')
 
 /* Kill a detached background process group (kept-alive preview
    servers, §24). Killing -PID targets the whole group — the bash
@@ -93,6 +96,20 @@ function startOrQueueTask(taskDoc) {
     taskId: taskDoc._id.toString(),
     prompt: taskDoc.prompt,
     permissions: taskDoc.permissions || agentConfig.defaultPermissions,
+    /* V1.2: server-resolved facts the worker needs — the client never
+       supplies these (§10 entitlements, §8 reference images, §9 upload). */
+    entitlements: taskDoc.entitlements || { webSearch: false, webSearchEnabled: true },
+    referenceImages: (taskDoc.reference_images || []).map(r => ({
+      path: pathMod.resolve(process.cwd(), agentConfig.uploads?.rootDir || 'agent-uploads', r.storage_path),
+      mime: r.mime_type, name: r.original_name,
+    })),
+    sourceUpload: taskDoc.source_upload && taskDoc.source_upload.upload_id ? {
+      name: taskDoc.source_upload.name,
+      files: taskDoc.source_upload.files,
+      bytes: taskDoc.source_upload.bytes,
+      rootDir: taskDoc.source_upload.root_dir,
+      skippedSecrets: (taskDoc.source_upload.skipped?.secrets || []).length,
+    } : null,
   }
   if (running.size >= agentConfig.orchestration.maxConcurrentTasks) {
     queue.push(task.taskId)
@@ -128,6 +145,16 @@ function launchWorker(taskDoc, task) {
         confirmations.set(id, { command, reason, requestedAt: Date.now() })
         await patchTask(taskId, { status: 'waiting_for_confirmation' })
         await emitAndPersist(taskDoc, 'confirmation_requested', { id, command, reason })
+        /* V1.2 §12.E: the user's attention is REQUIRED — this is the
+           one mid-task event worth a real notification (deduped). */
+        notifyUser(String(taskDoc.user_id), {
+          type: 'warning', kind: 'agent_confirmation_required',
+          title: 'KinyaBot Agent — approval needed',
+          message: `A command needs your approval: ${String(command || '').slice(0, 120)}`,
+          link: taskDoc.task_ref ? `/chat/agent/${taskDoc.task_ref}` : null,
+          dedupeKey: `confirm_${taskId}_${id}`,
+          meta: { taskId, confirmationId: id },
+        }).catch(() => {})
       })
     },
 
@@ -135,8 +162,14 @@ function launchWorker(taskDoc, task) {
       // Only verified-listening ports reach here (bridge probed them).
       enqueueTaskMutation(taskId, async () => {
         const port = ports[0]
-        await patchTask(taskId, { preview: { port, url_path: '/', started_at: new Date(), pid: handle.pid } })
-        await emitAndPersist(taskDoc, 'preview_ready', { port, url: `/api/agent/tasks/${taskDoc.task_ref}/preview/` })
+        await patchTask(taskId, {
+          'preview.mode': 'dev',
+          'preview.port': port,
+          'preview.url_path': '/',
+          'preview.started_at': new Date(),
+          'preview.pid': handle.pid,
+        })
+        await emitAndPersist(taskDoc, 'preview_ready', { port, url: `/api/agent/tasks/${taskDoc.task_ref}/preview/`, mode: 'dev' })
       })
     },
 
@@ -204,6 +237,28 @@ async function routeEvent(taskDoc, evt) {
     }
     case 'file_changed': {
       await AgentTask.findByIdAndUpdate(taskId, { $inc: { 'stats.files_changed': 1 } }).catch(() => {})
+      break
+    }
+    case 'terminal_blocked': {
+      /* V1.2 §13: a command the safety policy BLOCKED is a real
+         security-relevant event — record telemetry and (throttled)
+         surface it to Superadmins. Never noisy: one alert per 5 min. */
+      try {
+        await SecurityEvent.create({
+          type: 'agent_command_blocked', severity: 'warning',
+          message: `Agent blocked command: ${String(data.command || '').slice(0, 200)}`,
+          meta: { taskId, reason: data.reason || null, taskRef: taskDoc.task_ref },
+        })
+        await notifyAdmins({
+          title: 'Blocked command attempt in Agent task',
+          message: `The command safety policy blocked a command in task ${taskDoc.task_ref || taskId}: ${String(data.reason || '').slice(0, 160)}`,
+          type: 'warning', category: 'agent',
+          link: '/admin/agent',
+          resource: { kind: 'agent_task', id: taskId },
+          dedupeKey: `agent_cmd_blocked_${Math.floor(Date.now() / (5 * 60 * 1000))}`,
+          push: false,   // visible in the control center; not a PWA push (avoid alert storms)
+        })
+      } catch {}
       break
     }
     case 'background_process_started': {
@@ -285,7 +340,7 @@ async function finalizeTask(taskDoc, task, payload) {
     } else {
       killPidGroups(payload.backgroundPids || [])
       await emitAndPersist(taskDoc, 'preview_stopped', { port: fresh.preview.port }).catch(() => {})
-      await patchTask(taskId, { preview: { port: null, url_path: null, started_at: null, pid: null, pids: [], kept_alive: false } }).catch(() => {})
+      await patchTask(taskId, { preview: { mode: null, port: null, root: null, url_path: null, started_at: null, pid: null, pids: [], kept_alive: false } }).catch(() => {})
     }
   } else if (!keepPreview) {
     // No registered preview, but background procs may still exist
@@ -293,7 +348,104 @@ async function finalizeTask(taskDoc, task, payload) {
     killPidGroups(payload.backgroundPids || [])
   }
 
+  /* ── V1.2 §3/§11: STATIC PREVIEW engage on completion ──────
+     A finished task stops executing, but the preview must stay
+     inspectable. When no dev-server port was ever registered and the
+     workspace contains an index.html, the platform serves the files
+     directly (no process to keep alive, no port to probe). The
+     preview then lives exactly as long as the workspace — an
+     explicit stop (§11) or the idle cleaner ends it.       */
+  if (payload.ok === true && !fresh?.preview?.port && agentConfig.preview.staticEnabled) {
+    try {
+      const ws = new Workspace(taskId)
+      const root = await staticPreview.detectProjectRoot(ws.root)
+      if (root) {
+        await patchTask(taskId, {
+          'preview.mode': 'static',
+          'preview.root': root,
+          'preview.kept_alive': true,
+          'preview.started_at': new Date(),
+        }).catch(() => {})
+        await emitAndPersist(taskDoc, 'preview_ready', {
+          mode: 'static', root,
+          url: `/api/agent/tasks/${taskDoc.task_ref}/preview/`,
+          note: 'Served directly from the workspace — stays available while the workspace exists.',
+        }).catch(() => {})
+      }
+    } catch {}
+  }
+
+  /* ── V1.2 §12: REAL user notifications on terminal states ──
+     Persistent + realtime + Web Push where subscribed. Task events
+     are the ONLY trigger — no synthetic rows, dedupe by task id. */
+  try {
+    const link = taskDoc.task_ref ? `/chat/agent/${taskDoc.task_ref}` : null
+    if (payload.ok === true) {
+      await notifyUser(String(taskDoc.user_id), {
+        type: 'success', kind: 'agent_task_completed',
+        title: 'KinyaBot Agent — Task completed',
+        message: (String(payload.result || 'Your task finished.').slice(0, 240)) || 'Your task finished.',
+        link, dedupeKey: `task_done_${taskId}`,
+        meta: { taskRef: taskDoc.task_ref, taskId },
+      })
+    } else if (payload.code !== 'TASK_CANCELLED') {
+      await notifyUser(String(taskDoc.user_id), {
+        type: 'error', kind: 'agent_task_failed',
+        title: 'KinyaBot Agent — Task failed',
+        message: (payload.userSafe ? payload.error : friendlyAgentError(payload)).slice(0, 240),
+        link, dedupeKey: `task_fail_${taskId}`,
+        meta: { taskRef: taskDoc.task_ref, taskId, code: payload.code },
+      })
+    }
+  } catch {}
+
+  /* ── V1.2 §13: admin notifications from REAL system events ──
+     Worker crashes and failure-rate spikes surface in the Superadmin
+     control center (throttled + deduped; never per-task noise for
+     ordinary user-level failures). */
+  try {
+    if (['WORKER_CRASHED', 'WORKER_STUCK'].includes(payload.code)) {
+      await notifyAdmins({
+        title: 'Agent worker terminated unexpectedly',
+        message: `${friendlyAgentError(payload)} (task ${taskDoc.task_ref || taskId})`,
+        type: 'error', category: 'agent',
+        link: '/admin/agent',
+        resource: { kind: 'agent_task', id: taskId },
+        dedupeKey: `agent_worker_crash_${new Date().toISOString().slice(0, 13)}`,
+        meta: { code: payload.code },
+      })
+    }
+    await checkAgentFailureRate().catch(() => {})
+  } catch {}
+
   pumpQueue()
+}
+
+/* ── V1.2 §13: honest failure-rate alerting ─────────────────
+   Computed from REAL AgentTask documents over the last hour. Only
+   fires when there were enough tasks for the rate to be meaningful
+   (≥5) — a single user failure never raises a system alert.   */
+const failureRateNotifiedAt = { ts: 0 }
+async function checkAgentFailureRate() {
+  const since = new Date(Date.now() - 60 * 60 * 1000)
+  const [total, failed] = await Promise.all([
+    AgentTask.countDocuments({ created_at: { $gte: since } }),
+    AgentTask.countDocuments({ created_at: { $gte: since }, status: 'failed' }),
+  ])
+  if (total < 5 || failed === 0) return
+  const rate = failed / total
+  // Throttle: at most one rate alert per 30 minutes.
+  if (Date.now() - failureRateNotifiedAt.ts < 30 * 60 * 1000) return
+  if (rate >= 0.5) {
+    failureRateNotifiedAt.ts = Date.now()
+    await notifyAdmins({
+      title: 'High Agent task failure rate',
+      message: `${failed}/${total} agent tasks failed in the last hour (${Math.round(rate * 100)}%). Recent failures may share a root cause — inspect task logs.`,
+      type: 'warning', category: 'agent',
+      link: '/admin/agent',
+      dedupeKey: `agent_failure_rate_${new Date().toISOString().slice(0, 13)}`,
+    })
+  }
 }
 
 function friendlyAgentError(payload) {
@@ -396,11 +548,13 @@ async function cancelTask(taskId, reason = 'Task cancelled by the user') {
   }
   // Terminal task with a kept-alive preview: an explicit stop also
   // reaps its background dev server (§17 user intent is "shut it down").
-  if (['completed', 'failed', 'cancelled'].includes(doc.status) && doc.preview?.port) {
+  // V1.2 §11: an explicit stop ends the STATIC preview too — the user
+  // asked for "no preview", and that intent outlives the process model.
+  if (['completed', 'failed', 'cancelled'].includes(doc.status) && (doc.preview?.port || doc.preview?.mode === 'static')) {
     const pids = await backgroundPidsFor(id)
     killPidGroups(pids)
-    await emitAndPersist(doc, 'preview_stopped', { port: doc.preview.port }).catch(() => {})
-    await patchTask(id, { preview: { port: null, url_path: null, started_at: null, pid: null, pids: [], kept_alive: false } }).catch(() => {})
+    await emitAndPersist(doc, 'preview_stopped', { port: doc.preview.port || null, mode: doc.preview.mode || null }).catch(() => {})
+    await patchTask(id, { preview: { mode: null, port: null, root: null, url_path: null, started_at: null, pid: null, pids: [], kept_alive: false } }).catch(() => {})
     return { stopping: true, preview_stopped: true }
   }
   return { stopping: false, error: `Task is already ${doc.status}` }

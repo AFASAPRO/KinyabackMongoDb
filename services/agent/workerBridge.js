@@ -31,15 +31,24 @@ function buildWorkerEnv() {
     PATH: '/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin',
     HOME: '/tmp/kinya-agent-worker',   // scratch for the SDK, not a task workspace
     LANG: 'C.UTF-8',
-    // Model access — the ONLY credential the worker receives.
+    // Model access — the ONLY credentials the worker receives.
     GROQ_API_KEY: process.env.GROQ_API_KEY || '',
     GROQ_AGENT_MODEL: agentConfig.models.agent,
     GROQ_AGENT_PLANNING_MODEL: agentConfig.models.planning,
+    GROQ_AGENT_VISION_MODEL: agentConfig.models.vision,
     GROQ_CHAT_MODEL: process.env.GROQ_CHAT_MODEL || '',
     GROQ_MODEL: process.env.GROQ_MODEL || '',
     AGENT_PROVIDER: agentConfig.provider,
     AGENT_DEBUG: process.env.AGENT_DEBUG || '',
     AGENT_ENABLED: 'true',
+    /* V1.2 §10: the LangSearch key is a PROVIDER credential (like
+       GROQ_API_KEY), not a server secret — the worker's web_search
+       tool needs it to call the same sanctioned provider. JWT,
+       MongoDB, SMTP and admin secrets remain invisible here. */
+    LANGSEARCH_API_KEY: process.env.LANGSEARCH_API_KEY || '',
+    LANGSEARCH_ENDPOINT: process.env.LANGSEARCH_ENDPOINT || '',
+    LANGSEARCH_TIMEOUT_MS: process.env.LANGSEARCH_TIMEOUT_MS || '',
+    LANGSEARCH_COUNT: process.env.LANGSEARCH_COUNT || '',
     // Test-only escape hatch for the scripted provider — the provider
     // factory itself refuses it unless this OR NODE_ENV=test is set.
     KINYA_ALLOW_SCRIPTED_PROVIDER: process.env.KINYA_ALLOW_SCRIPTED_PROVIDER || '',

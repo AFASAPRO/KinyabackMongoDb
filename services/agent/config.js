@@ -29,6 +29,17 @@ function bool(name, fallback) {
 
 const agentModel = env('GROQ_AGENT_MODEL', env('GROQ_CHAT_MODEL', env('GROQ_MODEL', 'llama-3.3-70b-versatile')))
 
+/* V1.2 (§8): vision-capable model for reference-image understanding.
+   Groq's llama-4 family accepts image input; configured separately so
+   deployments without vision keep working (capability reported
+   honestly via /agent/config — never pretend a text model saw an
+   image). Fallback chain lets a single GROQ_VISION_MODEL cover both. */
+const visionModel = env('GROQ_AGENT_VISION_MODEL', env('GROQ_VISION_MODEL', 'meta-llama/llama-4-scout-17b-16e-instruct'))
+const VISION_CAPABLE_PATTERNS = [/llama-4/i, /llama-3\.2-\d+b-vision/i, /vision/i, /gemma-3/i, /qwen.*vl/i, /pixtral/i]
+function isVisionCapable(model) {
+  return VISION_CAPABLE_PATTERNS.some(re => re.test(String(model || '')))
+}
+
 const config = {
   /* ── Master switch — lets hosting environments without a suitable
      execution sandbox disable the Agent entirely (§39) while the
@@ -49,6 +60,10 @@ const config = {
   models: {
     agent: agentModel,
     planning: env('GROQ_AGENT_PLANNING_MODEL', agentModel),
+    vision: visionModel,
+  },
+  vision: {
+    capable: isVisionCapable(visionModel),   // honest capability flag
   },
 
   /* ── Loop bounds (§18 failure recovery — never an infinite loop) */
@@ -98,6 +113,31 @@ const config = {
     tokenTtlMs:         num('AGENT_PREVIEW_TOKEN_TTL', 10 * 60 * 1000),
     // Only local/loopback hosts may be proxied (SSRF guard)
     allowedHosts: ['127.0.0.1', 'localhost', '::1'],
+    /* V1.2 (§3.E): built-in static preview for HTML/CSS/JS projects —
+       workspace files served directly by the API process. This is the
+       DEFAULT preview path for plain static sites (zero install, zero
+       processes); framework projects keep their dev servers.     */
+    staticEnabled: bool('AGENT_PREVIEW_STATIC', true),
+    /* V1.2 (§11): how long a kept preview (dev server OR static) stays
+       available after task completion. Static previews live exactly as
+       long as the workspace itself (no process); dev servers are reaped
+       by the idle workspace cleaner or an explicit stop.        */
+  },
+
+  /* ── Uploads (V1.2 §8/§9) ───────────────────────────────── */
+  uploads: {
+    enabled:          bool('AGENT_UPLOADS_ENABLED', true),
+    rootDir:          env('AGENT_UPLOAD_ROOT', 'agent-uploads'),
+    imageMaxBytes:    num('AGENT_UPLOAD_IMAGE_MAX', 6 * 1024 * 1024),
+    zipMaxBytes:      num('AGENT_UPLOAD_ZIP_MAX', 60 * 1024 * 1024),
+    maxReferenceImages: num('AGENT_UPLOAD_MAX_IMAGES', 4),
+    /* hardened extraction limits (§9 archive security) */
+    extract: {
+      maxEntries:     num('AGENT_ZIP_MAX_ENTRIES', 3000),
+      maxTotalBytes:  num('AGENT_ZIP_MAX_TOTAL', 150 * 1024 * 1024),
+      maxFileBytes:   num('AGENT_ZIP_MAX_FILE', 30 * 1024 * 1024),
+      maxRatio:       num('AGENT_ZIP_MAX_RATIO', 100),
+    },
   },
 
   /* ── Permissions granted to a V1.1 task (§21).

@@ -48,6 +48,11 @@ const EVENT_MAP = {
   task_failed: 'task.failed',
   task_cancelled: 'task.cancelled',
   task_created: 'task.created',
+  /* V1.2: uploads + web research lifecycle (§8–§10) */
+  task_upload_extracted: 'task.upload.extracted',
+  search_started: 'task.search.started',
+  search_completed: 'task.search.completed',
+  search_failed: 'task.search.failed',
 }
 
 /* Events whose payloads may contain content worth bounding before

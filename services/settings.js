@@ -29,6 +29,18 @@ const DEFAULTS = {
   web_search_timeout_ms: 12000,      // per-search backend timeout
   web_search_allowed_domains: [],    // empty = no restriction
   web_search_blocked_domains: [],    // always excluded
+  /* ── Agent runtime overrides (V1.2 §14.C) ─────────────────────
+     Safe operational knobs the Superadmin can flip live WITHOUT a
+     redeploy; env vars remain the boot-time defaults. Everything
+     security-critical (keys, secrets) stays env-only.            */
+  agent_enabled: true,               // global kill switch (runtime)
+  agent_max_concurrent: 2,           // simultaneous running workers
+  agent_task_timeout_ms: 900000,     // per-task duration cap
+  agent_command_timeout_ms: 120000,  // per-command cap
+  agent_daily_limit: 30,             // tasks per user per day
+  agent_preview_enabled: true,       // preview feature toggle
+  agent_uploads_enabled: true,       // reference images + project zips
+  agent_websearch_policy: 'plan',    // 'plan' = honor plan entitlements; 'disabled' = off for everyone
 }
 
 let cfg = { ...DEFAULTS }
@@ -47,6 +59,8 @@ function update(partial = {}) {
     'web_search_enabled', 'web_search_auto_enabled', 'web_search_max_results',
     'web_search_max_queries', 'web_search_cache_minutes', 'web_search_timeout_ms',
     'web_search_allowed_domains', 'web_search_blocked_domains',
+    'agent_enabled', 'agent_max_concurrent', 'agent_task_timeout_ms', 'agent_command_timeout_ms',
+    'agent_daily_limit', 'agent_preview_enabled', 'agent_uploads_enabled', 'agent_websearch_policy',
   ]
   for (const k of allowed) {
     if (Object.prototype.hasOwnProperty.call(partial, k)) cfg[k] = partial[k]

@@ -44,13 +44,14 @@ for i in $(seq 1 30); do
   sleep 1
 done
 
-echo "── running agent test suite (V1.1) …"
+echo "── running agent test suite (V1.1 + V1.2) …"
 node --test tests/agent/tools.test.js \
           tests/agent/commandSafety.test.js \
           tests/agent/toolCallRepair.test.js \
           tests/agent/security.test.js \
           tests/agent/zipDownload.test.js \
-          tests/agent/integration.test.js
+          tests/agent/integration.test.js \
+          tests/agent/v12features.test.js
 STATUS=$?
 
 # Cleanup: the forked memory server + any stray worker processes.

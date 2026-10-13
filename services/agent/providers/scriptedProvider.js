@@ -67,6 +67,39 @@ const SCRIPTS = {
     ],
   },
 
+  /* V1.2 §3 acceptance — a MODERN ANIMATED site with SEPARATE css/js
+     + a local image + a working button interaction. No dev server is
+     started: the platform's built-in STATIC preview serves the files,
+     which is exactly what the E2E verifies (styles + script + image
+     through the authenticated preview proxy).                       */
+  'Create a small modern animated website with a stylesheet, script and image.': {
+    plan: ['Create the HTML page', 'Add the stylesheet and script', 'Add a local image asset', 'Verify the files', 'Report'],
+    turns: [
+      { tool_calls: [{ name: 'create_file', arguments: {
+        path: 'index.html',
+        content: '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n<title>Nightbrew Coffee</title>\n<link rel="stylesheet" href="css/style.css">\n</head>\n<body>\n<main>\n  <h1>Nightbrew Coffee</h1>\n  <p class="tagline">Slow-roasted under city lights.</p>\n  <img src="images/logo.svg" alt="Nightbrew logo" width="72" height="72">\n  <button id="order-btn" type="button">Order a cup</button>\n  <p id="order-msg" role="status"></p>\n</main>\n<script src="app.js"></script>\n</body>\n</html>\n',
+      } }] },
+      { tool_calls: [{ name: 'create_file', arguments: {
+        path: 'css/style.css',
+        content: ':root{--ink:#12100e;--paper:#f7f3ec;--accent:#c6f432}\n*{box-sizing:border-box}\nbody{margin:0;min-height:100vh;display:grid;place-items:center;background:linear-gradient(160deg,var(--ink),#2a231c);color:var(--paper);font-family:system-ui,sans-serif}\nmain{text-align:center;padding:48px 32px;border-radius:24px;background:rgba(255,255,255,.04);animation:rise .7s ease both}\nh1{margin:0 0 6px;font-size:2.4rem;letter-spacing:-.02em}\n.tagline{margin:0 0 22px;color:#b9b2a6}\nimg{filter:drop-shadow(0 6px 18px rgba(0,0,0,.5))}\nbutton{margin-top:18px;padding:12px 26px;border:none;border-radius:999px;background:var(--accent);color:#14180a;font-weight:700;font-size:1rem;cursor:pointer;transition:transform .15s ease}\nbutton:hover{transform:translateY(-2px) scale(1.03)}\nbutton.done{background:#34d399}\n#order-msg{min-height:1.4em;color:var(--accent)}\n@keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}\n',
+      } }] },
+      { tool_calls: [{ name: 'create_file', arguments: {
+        path: 'app.js',
+        content: 'document.getElementById("order-btn").addEventListener("click", function () {\n  this.classList.add("done")\n  this.textContent = "Brewing…"\n  document.getElementById("order-msg").textContent = "Your cup is on the way!"\n})\n',
+      } }] },
+      { tool_calls: [{ name: 'create_file', arguments: {
+        path: 'images/logo.svg',
+        content: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 72"><circle cx="36" cy="36" r="34" fill="#12100e" stroke="#c6f432" stroke-width="3"/><path d="M22 40c0-10 6-16 14-16s14 6 14 16" fill="none" stroke="#f7f3ec" stroke-width="4" stroke-linecap="round"/><circle cx="30" cy="34" r="3" fill="#c6f432"/><circle cx="42" cy="34" r="3" fill="#c6f432"/></svg>\n',
+      } }] },
+      { tool_calls: [{ name: 'run_command', arguments: { command: 'ls -la index.html css/style.css app.js images/logo.svg && node -e "require(\'fs\')" 2>/dev/null; echo files-ok' } }] },
+      { content: 'Created a modern animated single-page site: index.html with a separate stylesheet (css/style.css), a separate script (app.js) and a local SVG image (images/logo.svg). The page animates in on load and the Order button interacts through JavaScript.' },
+    ],
+    verification: [
+      { tool_calls: [{ name: 'read_file', arguments: { path: 'css/style.css' } }] },
+      { content: 'VERIFIED: read css/style.css back from disk — the stylesheet, script and image files all exist in the workspace.' },
+    ],
+  },
+
   /* Failure-recovery test: the model tries a wrong path, reads the
      honest error, self-corrects and continues. */
   'Fix the file at src/app.js.': {

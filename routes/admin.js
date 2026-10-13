@@ -1754,4 +1754,298 @@ router.get('/subscription-stats', async (req, res) => {
   catch (err) { console.error('[SubscriptionStats]', err); res.status(500).json({ error: 'Could not load subscription statistics' }) }
 })
 
+/* ══════════════════════════════════════════════════════════════════
+   V1.2 §14 — SUPERADMIN AGENT MANAGEMENT
+   Real data only: every metric is aggregated from actual AgentTask /
+   AgentEvent / SecurityEvent documents. No invented statistics — a
+   metric that cannot be computed reliably is reported as null.
+   All mutations write an immutable audit row.
+══════════════════════════════════════════════════════════════════ */
+const agentConfig    = require('../services/agent/config')
+const orchestrator   = require('../services/agent/orchestrator')
+const { AgentTask, AgentEvent } = require('../models')
+
+/* ── A. Overview: live + recent metrics from REAL documents ───── */
+router.get('/agent/overview', async (req, res) => {
+  try {
+    const { start } = parseRange(req.query.range)
+    const [statusCounts, ranged, avgDuration, blockedCommands, workerCrashes, previewStats] = await Promise.all([
+      AgentTask.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]).catch(() => []),
+      AgentTask.aggregate([
+        { $match: { created_at: { $gte: start } } },
+        { $group: { _id: '$status', count: { $sum: 1 } } },
+      ]).catch(() => []),
+      AgentTask.aggregate([
+        { $match: { status: 'completed', 'stats.duration_ms': { $ne: null }, created_at: { $gte: start } } },
+        { $group: { _id: null, avg: { $avg: '$stats.duration_ms' }, max: { $max: '$stats.duration_ms' }, n: { $sum: 1 } } },
+      ]).catch(() => []),
+      SecurityEvent.countDocuments({ type: 'agent_command_blocked', created_at: { $gte: start } }).catch(() => 0),
+      AgentTask.countDocuments({ error_code: { $in: ['WORKER_CRASHED', 'WORKER_STUCK', 'SERVER_RESTART'] }, created_at: { $gte: start } }).catch(() => 0),
+      AgentTask.aggregate([
+        { $match: { created_at: { $gte: start } } },
+        { $group: { _id: null, withDev: { $sum: { $cond: [{ $eq: ['$preview.mode', 'dev'] }, 1, 0] } }, static: { $sum: { $cond: [{ $eq: ['$preview.mode', 'static'] }, 1, 0] } } } },
+      ]).catch(() => []),
+    ])
+
+    const by = Object.fromEntries(statusCounts.map(r => [r._id, r.count]))
+    const rangedBy = Object.fromEntries(ranged.map(r => [r._id, r.count]))
+    const rangedTotal = ranged.reduce((a, r) => a + r.count, 0)
+    const rangedFailed = (rangedBy.failed || 0) + (rangedBy.cancelled || 0)
+    const dur = avgDuration[0] || null
+
+    res.json({
+      totals: {
+        all: statusCounts.reduce((a, r) => a + r.count, 0),
+        running: by.running || 0,
+        queued: by.queued || 0,
+        planning: by.planning || 0,
+        waiting: by.waiting_for_confirmation || 0,
+        completed: by.completed || 0,
+        failed: by.failed || 0,
+        cancelled: by.cancelled || 0,
+      },
+      range: {
+        label: req.query.range || '7d',
+        total: rangedTotal,
+        completed: rangedBy.completed || 0,
+        failed: rangedBy.failed || 0,
+        cancelled: rangedBy.cancelled || 0,
+        success_rate: rangedTotal ? Math.round(((rangedBy.completed || 0) / rangedTotal) * 1000) / 10 : null,
+        failure_rate: rangedTotal ? Math.round((rangedFailed / rangedTotal) * 1000) / 10 : null,
+      },
+      avg_duration_ms: dur && dur.n ? Math.round(dur.avg) : null,
+      max_duration_ms: dur ? dur.max : null,
+      workers: {
+        running_now: orchestrator.runningCount(),
+        queue_length: orchestrator.queue ? orchestrator.queue.length : 0,
+        max_concurrent: Number(settings.get().agent_max_concurrent) || agentConfig.orchestration.maxConcurrentTasks,
+        crashes_24h: workerCrashes,
+      },
+      previews: {
+        dev: previewStats[0]?.withDev || 0,
+        static: previewStats[0]?.static || 0,
+        enabled: agentConfig.preview.enabled && settings.get().agent_preview_enabled !== false,
+      },
+      security: { blocked_commands: blockedCommands },
+      agent_enabled: agentConfig.enabled && settings.get().agent_enabled !== false,
+    })
+  } catch (err) {
+    console.error('[AgentOverview]', err)
+    res.status(500).json({ error: 'Could not load Agent metrics' })
+  }
+})
+
+/* ── B. Task management: browse / search / inspect / cancel ──── */
+function safeAgentTask(t, user) {
+  return {
+    id: t._id.toString(),
+    task_ref: t.task_ref,
+    title: t.title,
+    status: t.status,
+    user: user ? { id: user._id?.toString?.() || String(user._id), username: user.username, email: user.email } : null,
+    created_at: t.created_at,
+    started_at: t.started_at,
+    completed_at: t.completed_at,
+    duration_ms: t.stats?.duration_ms ?? null,
+    steps: t.stats?.steps ?? null,
+    tool_calls: t.stats?.tool_calls ?? null,
+    commands_run: t.stats?.commands_run ?? null,
+    files_changed: t.stats?.files_changed ?? null,
+    error: t.error || null,
+    error_code: t.error_code || null,
+    preview: t.preview ? { mode: t.preview.mode, port: t.preview.port, root: t.preview.root, kept_alive: t.preview.kept_alive } : null,
+    source_upload: t.source_upload && t.source_upload.upload_id ? { name: t.source_upload.name, files: t.source_upload.files } : null,
+    reference_images: (t.reference_images || []).length,
+    conversation_id: t.conversation_id ? String(t.conversation_id) : null,
+  }
+}
+
+router.get('/agent/tasks', async (req, res) => {
+  try {
+    const page = Math.max(1, Number(req.query.page) || 1)
+    const limit = Math.min(100, Math.max(5, Number(req.query.limit) || 25))
+    const q = { }
+    if (req.query.status) q.status = String(req.query.status)
+    if (req.query.search) {
+      const rx = new RegExp(escapeRegex(String(req.query.search).slice(0, 80)), 'i')
+      q.$or = [{ title: rx }, { task_ref: rx }, { prompt: rx }]
+    }
+    if (req.query.range) {
+      const { start } = parseRange(req.query.range)
+      q.created_at = { $gte: start }
+    }
+    const [docs, total] = await Promise.all([
+      AgentTask.find(q).sort({ created_at: -1 }).skip((page - 1) * limit).limit(limit)
+        .populate('user_id', 'username email').lean(),
+      AgentTask.countDocuments(q),
+    ])
+    res.json({
+      tasks: docs.map(t => safeAgentTask(t, t.user_id)),
+      total, page, pages: Math.max(1, Math.ceil(total / limit)),
+    })
+  } catch (err) {
+    console.error('[AgentTasks]', err)
+    res.status(500).json({ error: 'Could not load Agent tasks' })
+  }
+})
+
+router.get('/agent/tasks/:id', async (req, res) => {
+  try {
+    const id = String(req.params.id)
+    const q = /^[a-f0-9]{24}$/i.test(id) ? { _id: id } : { task_ref: id }
+    const doc = await AgentTask.findOne(q).populate('user_id', 'username email').lean()
+    if (!doc) return res.status(404).json({ error: 'Agent task not found' })
+    // Task-level operational logs: recent bounded events (safe subset)
+    const events = await AgentEvent.find({ task_id: doc._id }, { type: 1, data: 1, seq: 1, created_at: 1 })
+      .sort({ seq: -1 }).limit(60).lean().catch(() => [])
+    res.json({
+      task: safeAgentTask(doc, doc.user_id),
+      prompt: doc.prompt ? String(doc.prompt).slice(0, 1200) : null,
+      result: doc.result ? String(doc.result).slice(0, 2000) : null,
+      plan: doc.plan || [],
+      model: doc.stats?.model || null,
+      tokens: doc.stats?.tokens ?? null,
+      entitlements: doc.entitlements || null,
+      events: events.map(e => ({ type: e.type, seq: e.seq, at: e.created_at, data: e.data && typeof e.data === 'object' ? Object.fromEntries(Object.entries(e.data).slice(0, 8)) : e.data })),
+    })
+  } catch (err) {
+    console.error('[AgentTaskDetail]', err)
+    res.status(500).json({ error: 'Could not load the Agent task' })
+  }
+})
+
+router.post('/agent/tasks/:id/cancel', async (req, res) => {
+  try {
+    const id = String(req.params.id)
+    const q = /^[a-f0-9]{24}$/i.test(id) ? { _id: id } : { task_ref: id }
+    const doc = await AgentTask.findOne(q)
+    if (!doc) return res.status(404).json({ error: 'Agent task not found' })
+    const active = ['queued', 'planning', 'running', 'waiting_for_confirmation'].includes(doc.status)
+    if (!active) return res.status(409).json({ error: `Task is already ${doc.status}`, code: 'NOT_ACTIVE' })
+    await orchestrator.cancelTask(doc._id.toString(), `Cancelled by Superadmin ${req.admin.username}`)
+    await writeAudit(req.admin, 'agent.task.cancel', {
+      resourceType: 'agent_task', resourceId: doc._id.toString(), resourceLabel: doc.title,
+      meta: { taskRef: doc.task_ref, status: doc.status }, req,
+    })
+    res.json({ ok: true })
+  } catch (err) {
+    console.error('[AgentTaskCancel]', err)
+    res.status(500).json({ error: 'Could not cancel the Agent task' })
+  }
+})
+
+/* ── C. Agent configuration (safe runtime settings, validated) ── */
+const AGENT_RUNTIME_KEYS = {
+  agent_enabled: v => typeof v === 'boolean',
+  agent_max_concurrent: v => Number.isInteger(v) && v >= 1 && v <= 16,
+  agent_task_timeout_ms: v => Number.isInteger(v) && v >= 60000 && v <= 3600000,
+  agent_command_timeout_ms: v => Number.isInteger(v) && v >= 10000 && v <= 600000,
+  agent_daily_limit: v => Number.isInteger(v) && v >= 1 && v <= 500,
+  agent_preview_enabled: v => typeof v === 'boolean',
+  agent_uploads_enabled: v => typeof v === 'boolean',
+  agent_websearch_policy: v => ['plan', 'disabled'].includes(v),
+}
+
+router.get('/agent/config', async (_req, res) => {
+  const cfg = settings.get()
+  res.json({
+    runtime: {
+      agent_enabled: cfg.agent_enabled,
+      agent_max_concurrent: cfg.agent_max_concurrent,
+      agent_task_timeout_ms: cfg.agent_task_timeout_ms,
+      agent_command_timeout_ms: cfg.agent_command_timeout_ms,
+      agent_daily_limit: cfg.agent_daily_limit,
+      agent_preview_enabled: cfg.agent_preview_enabled,
+      agent_uploads_enabled: cfg.agent_uploads_enabled,
+      agent_websearch_policy: cfg.agent_websearch_policy,
+    },
+    env: {
+      provider: agentConfig.provider,
+      model: agentConfig.models.agent,
+      planning_model: agentConfig.models.planning,
+      vision_model: agentConfig.models.vision,
+      vision_capable: agentConfig.vision.capable,
+      execution_mode: agentConfig.executionMode,
+      max_steps: agentConfig.loop.maxSteps,
+      upload_image_max_bytes: agentConfig.uploads.imageMaxBytes,
+      upload_zip_max_bytes: agentConfig.uploads.zipMaxBytes,
+    },
+  })
+})
+
+router.put('/agent/config', async (req, res) => {
+  try {
+    const body = req.body || {}
+    const patch = {}
+    for (const [key, validate] of Object.entries(AGENT_RUNTIME_KEYS)) {
+      if (body[key] === undefined) continue
+      if (!validate(body[key])) {
+        return res.status(400).json({ error: `Invalid value for ${key}`, field: key })
+      }
+      patch[key] = body[key]
+    }
+    if (!Object.keys(patch).length) return res.status(400).json({ error: 'No valid settings provided' })
+    settings.update(patch)
+    await writeAudit(req.admin, 'agent.settings.update', {
+      resourceType: 'agent_settings', resourceLabel: 'Agent runtime',
+      meta: { patch }, req,
+    })
+    // A disable is a real operational event worth a control-center row.
+    if (patch.agent_enabled === false) {
+      notifyAdmins({ title: 'Agent disabled by Superadmin', message: `${req.admin.username} disabled Agent execution. Running tasks continue; new tasks are refused.`, type: 'warning', category: 'agent', link: '/admin/agent' }).catch(() => {})
+    }
+    res.json({ ok: true, runtime: settings.get() })
+  } catch (err) {
+    console.error('[AgentConfig]', err)
+    res.status(500).json({ error: 'Could not update Agent settings' })
+  }
+})
+
+/* ── D. Worker + service health (honest, probed where possible) ── */
+router.get('/agent/health', async (_req, res) => {
+  try {
+    const cfg = settings.get()
+    const pushStatus = pushService.status()
+    res.json({
+      orchestrator: {
+        attached: typeof orchestrator.getIo === 'function',
+        running_tasks: orchestrator.runningCount(),
+        queue_length: orchestrator.queue ? orchestrator.queue.length : 0,
+      },
+      workers: {
+        execution_mode: agentConfig.executionMode,
+        available: true,   // local mode: workers fork on demand — verified by real runs, not asserted from the dashboard
+        recent_crashes: await AgentTask.countDocuments({ error_code: { $in: ['WORKER_CRASHED', 'WORKER_STUCK'] }, created_at: { $gte: new Date(Date.now() - 24 * 3600 * 1000) } }).catch(() => null),
+      },
+      provider: {
+        name: agentConfig.provider,
+        model_configured: !!agentConfig.models.agent,
+        vision_configured: agentConfig.vision.capable,
+        // Honest: the dashboard NEVER claims Groq is reachable — that
+        // is only proven by /admin/ai/test, which performs a real call.
+        connectivity: 'check_ai_test',
+      },
+      preview: {
+        enabled: agentConfig.preview.enabled && cfg.agent_preview_enabled !== false,
+        static_enabled: agentConfig.preview.staticEnabled,
+      },
+      web_search: {
+        provider_configured: !!aiConfig.langSearch?.apiKey,
+        enabled_for_agent: cfg.agent_websearch_policy !== 'disabled' && cfg.web_search_enabled !== false,
+      },
+      push: {
+        library: pushStatus.library,
+        configured: pushStatus.enabled,
+        subscriptions: await pushService.subscriptionCount().catch(() => null),
+      },
+      uploads: {
+        enabled: agentConfig.uploads.enabled && cfg.agent_uploads_enabled !== false,
+      },
+    })
+  } catch (err) {
+    console.error('[AgentHealth]', err)
+    res.status(500).json({ error: 'Could not load Agent health' })
+  }
+})
+
 module.exports = router

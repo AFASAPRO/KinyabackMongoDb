@@ -67,7 +67,17 @@ async function scanProject(ctx) {
   const scripts = pkg?.scripts || {}
   const language = exists('tsconfig.json') ? 'typescript' : (pkg ? 'javascript' : (ctxData.pyproject || exists('requirements.txt') ? 'python' : (exists('index.html') ? 'html' : null)))
 
-  const devServerCommand = scripts.dev ? `npm run dev` : (frameworks.some(f => f.id === 'python') ? 'python -m http.server 8000' : (frameworks.some(f => f.id === 'static-html') ? 'python -m http.server 8000' : null))
+  /* V1.2 §3.E: plain static projects need NO server at all — the
+     platform serves workspace files directly as the preview. Only
+     package.json projects get a dev-server suggestion (their real
+     `npm run dev`); Python projects may use http.server when the
+     task genuinely needs a live backend.                            */
+  const devServerCommand = scripts.dev
+    ? 'npm run dev'
+    : (frameworks.some(f => f.id === 'python') ? 'python3 -m http.server 8000' : null)
+  const staticPreview = !pkg && frameworks.some(f => f.id === 'static-html')
+    ? { note: 'Plain HTML/CSS/JS project — the platform previews it automatically. No server is needed.' }
+    : null
   const buildCommand = scripts.build ? 'npm run build' : null
   const testCommand = scripts.test && scripts.test !== 'echo "Error: no test specified" && exit 1' ? 'npm test' : (language === 'python' && exists('tests') ? 'python -m pytest' : null)
 
@@ -92,7 +102,7 @@ async function scanProject(ctx) {
     isPackageJson: !!pkg,
     packageJson: pkg ? { name: pkg.name || null, version: pkg.version || null, scripts, dependencies: Object.keys(pkg.dependencies || {}), devDependencies: Object.keys(pkg.devDependencies || {}) } : null,
     frameworks, language, packageManager,
-    devServerCommand, buildCommand, testCommand,
+    devServerCommand, staticPreview, buildCommand, testCommand,
     entryPoints: [...new Set(entryPoints)], sourceDirs,
   }
 }
@@ -124,10 +134,10 @@ function registerAll() {
 
   registerTool({
     name: 'detect_dev_server',
-    description: 'Detect the command that starts the development server for the workspace project, if any.',
+    description: 'Detect the command that starts the development server for the workspace project, if any. Plain HTML/CSS/JS projects do NOT need one — the platform previews their files automatically after completion.',
     parameters: { type: 'object', properties: {}, required: [] },
     permission: 'READ', risk: 'low', category: 'project',
-    handler: async ({ ctx }) => { const s = await scanProject(ctx); return { devServerCommand: s.devServerCommand, scripts: s.packageJson?.scripts || null } },
+    handler: async ({ ctx }) => { const s = await scanProject(ctx); return { devServerCommand: s.devServerCommand, staticPreview: s.staticPreview || null, scripts: s.packageJson?.scripts || null } },
   })
 
   registerTool({

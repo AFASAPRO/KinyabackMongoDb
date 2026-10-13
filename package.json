@@ -25,7 +25,8 @@
     "nodemailer": "^6.9.10",
     "pdf-parse": "^1.1.1",
     "socket.io": "^4.7.4",
-    "web-push": "^3.6.7"
+    "web-push": "^3.6.7",
+    "yauzl": "^3.4.0"
   },
   "devDependencies": {
     "mongodb-memory-server": "^11.3.0",
