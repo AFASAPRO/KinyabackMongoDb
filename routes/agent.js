@@ -20,6 +20,7 @@
  *   DELETE /api/agent/tasks/:idOrRef/file     user deletes a file
  *   GET  /api/agent/tasks/:idOrRef/changes    real diff records
  *   GET  /api/agent/tasks/:idOrRef/logs       structured execution logs
+ *   GET  /api/agent/tasks/:idOrRef/download   workspace as streamed .zip (V1.1 §8)
  *   GET  /api/agent/tasks/:idOrRef/preview/*  live preview proxy (§24)
  *
  * NO FAKE DATA (§32): everything returned comes from real DB
@@ -29,6 +30,8 @@ const express = require('express')
 const mongoose = require('mongoose')
 const crypto = require('crypto')
 const http = require('http')
+const path = require('path')
+const fs = require('fs')
 const fsp = require('fs').promises
 
 const { AgentTask, AgentEvent, Chat, Message } = require('../models')
@@ -46,7 +49,8 @@ const bridge = require('../services/agent/workerBridge')
 require('../services/agent/tools/filesystem')
 require('../services/agent/tools/terminal')
 require('../services/agent/tools/project').registerAll()
-require('../services/agent/tools/git')
+/* V1.1 (§11): Git tools removed from the Agent-facing registry. Git commands
+   remain reachable through run_command with full command-safety classification. */
 
 const router = express.Router()
 const userOnly = [authGuard]
@@ -102,6 +106,8 @@ router.get('/agent/config', ...userOnly, async (req, res) => {
     runningNow: orchestrator.runningCount(),
     taskTimeoutMs: agentConfig.limits.taskTimeoutMs,
     permissions: agentConfig.defaultPermissions,
+    provider: agentConfig.provider,
+    model: agentConfig.models.agent,
     tools: registry.listTools().map(t => ({ name: t.name, category: t.category, permission: t.permission, risk: t.risk })),
   })
 })
@@ -408,6 +414,149 @@ router.get('/agent/tasks/:idOrRef/logs', ...userOnly, async (req, res) => {
     res.status(500).json({ error: 'Logs could not be loaded.' })
   }
 })
+
+/* ── DOWNLOAD PROJECT AS ZIP (§8 V1.1) ──────────────────────────
+   GET /api/agent/tasks/:idOrRef/download
+
+   Streams the REAL workspace of the task as a .zip archive:
+
+   Security & integrity:
+   • authGuard + findOwnTask → ownership enforced (404 for others)
+   • walk starts at the workspace root and only follows entries whose
+     resolved path stays INSIDE it (path-traversal proof)
+   • symbolic links are skipped entirely (no escape via symlink)
+   • secrets & junk excluded: .env*, node_modules, .git, .tmp,
+     caches, log files, OS droppings
+   • hard caps: file count + total bytes (413 beyond) — no zip bombs
+   • STREAMED with archiver straight to the response — the archive
+     is never buffered in memory and no temp file is created, so
+     there is nothing to clean up on failure
+   • filename derived from the task title (slugified) + task ref    */
+const ZIP_EXCLUDED_DIRS = new Set([
+  'node_modules', '.git', '.tmp', '.cache', '__pycache__', '.venv',
+  'venv', '.idea', '.vscode-server', '.npm', '.yarn', '.DS_Store',
+])
+const ZIP_EXCLUDED_FILEPatterns = [
+  /^\.env(\..*)?$/i,       // .env, .env.local, .env.production …
+  /^\.port$/i,             // agent-internal dev-server bookkeeping
+  /\.log$/i,               // stray log files
+  /\.pid$/i,
+  /^\.DS_Store$/i,
+  /^npm-debug\.log$/i,
+  /^yarn-error\.log$/i,
+]
+const ZIP_MAX_FILES = 12000
+const ZIP_MAX_BYTES = 200 * 1024 * 1024 // 200 MB
+
+function zipExcluded(name) {
+  if (ZIP_EXCLUDED_DIRS.has(name)) return true
+  return ZIP_EXCLUDED_FILEPatterns.some(re => re.test(name))
+}
+
+function taskSlug(title) {
+  return String(title || 'agent-project')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48) || 'agent-project'
+}
+
+/** Recursively collect safe entries (relative paths) under root. */
+async function collectZipEntries(rootPath) {
+  const entries = []
+  let totalBytes = 0
+  // Compare against the REAL path of the root so a symlinked base dir
+  // (e.g. /tmp → /private/tmp) never yields false containment failures.
+  const root = await fsp.realpath(rootPath).catch(() => rootPath)
+
+  async function walk(relDir) {
+    const absDir = relDir ? path.join(root, relDir) : root
+    let dirents
+    try { dirents = await fsp.readdir(absDir, { withFileTypes: true }) }
+    catch { return }
+    for (const d of dirents) {
+      if (entries.length >= ZIP_MAX_FILES) return
+      const rel = relDir ? `${relDir}/${d.name}` : d.name
+      if (zipExcluded(d.name)) continue
+      // Symlinks are NEVER followed or packed (§8 symlink attacks).
+      if (d.isSymbolicLink()) continue
+      const abs = path.join(root, rel)
+      // Defense-in-depth: resolved path must remain inside the root.
+      const resolved = await fsp.realpath(abs).catch(() => null)
+      if (!resolved || !resolved.startsWith(root + path.sep) && resolved !== root) continue
+      if (d.isDirectory()) {
+        await walk(rel)
+      } else if (d.isFile()) {
+        const st = await fsp.stat(abs).catch(() => null)
+        if (!st || !st.isFile()) continue
+        if (st.size > 64 * 1024 * 1024) continue // skip absurd single files
+        totalBytes += st.size
+        if (totalBytes > ZIP_MAX_BYTES) {
+          const e = new Error('The workspace is too large to package (over 200 MB).')
+          e.code = 'ZIP_TOO_LARGE'; throw e
+        }
+        entries.push({ rel, abs, size: st.size })
+      }
+    }
+  }
+
+  await walk('')
+  return entries
+}
+
+router.get('/agent/tasks/:idOrRef/download', ...userOnly, async (req, res) => {
+  let doc = null
+  try {
+    doc = await findOwnTask(req, res)
+    if (!doc) return
+    const ws = await requireWorkspace(req, res, doc)
+    if (!ws) return
+
+    const entries = await collectZipEntries(ws.root)
+    if (!entries.length) {
+      return res.status(409).json({ error: 'The workspace is empty — there is nothing to download yet.', code: 'ZIP_EMPTY' })
+    }
+
+    const filename = `${taskSlug(doc.title)}-${doc.task_ref.slice(0, 8)}.zip`
+    res.setHeader('Content-Type', 'application/zip')
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`)
+    res.setHeader('X-Archive-Files', String(entries.length))
+    res.setHeader('Cache-Control', 'no-store')
+
+    /* Stream: archiver → response. Nothing is buffered in memory and
+       no temporary archive file is ever written (§8 cleanup by
+       construction). A client disconnect aborts the stream safely. */
+    const archiver = require('archiver')
+    const archive = archiver('zip', { zlib: { level: 6 } })
+    archive.on('warning', (err) => console.warn('[Agent] zip warning:', err?.message || err))
+    archive.on('error', (err) => {
+      console.error('[Agent] zip stream failed:', err?.message || err)
+      if (!res.headersSent) res.status(500).json({ error: 'The archive could not be created.' })
+      else res.end()
+    })
+    req.on('close', () => { if (!res.writableEnded) archive.abort?.() })
+    archive.pipe(res)
+
+    for (const e of entries) {
+      // entry name is the SAFE relative path (already verified inside root)
+      archive.append(require('fs').createReadStream(e.abs), { name: e.rel })
+    }
+    await archive.finalize()
+
+    logActivity('agent_task_downloaded', {
+      username: req.user.username, user_id: req.user.id,
+      meta: { taskId: doc._id.toString(), files: entries.length },
+    })
+  } catch (err) {
+    if (err?.code === 'ZIP_TOO_LARGE') {
+      return res.status(413).json({ error: err.message })
+    }
+    if (res.headersSent) { try { res.end() } catch {} return }
+    console.error('[Agent] download failed:', err)
+    res.status(500).json({ error: 'The project archive could not be created.' })
+  }
+})
+
 
 /* ── Preview token (§24) — iframe-friendly auth ──────────────── */
 router.get('/agent/tasks/:idOrRef/preview-token', ...userOnly, async (req, res) => {

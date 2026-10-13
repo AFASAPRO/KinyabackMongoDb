@@ -21,8 +21,10 @@ const Groq = require('groq-sdk')
 const config = require('./config')
 
 let client = null
+let clientOverride = null   // test seam (never used in production paths)
 
 function getClient() {
+  if (clientOverride) return clientOverride
   if (!config.apiKey) {
     const error = new Error('GROQ_NOT_CONFIGURED')
     error.code = 'GROQ_NOT_CONFIGURED'
@@ -32,10 +34,24 @@ function getClient() {
   return client
 }
 
+/** Test-only injection point so retries/normalisation are testable
+    without network access. Setting it back to null restores the real
+    client resolution. */
+function setClientForTests(fake) {
+  clientOverride = fake
+  if (!fake) client = null
+}
+
 /* Normalize provider errors into coded errors the API layer can
    translate into honest, user-facing messages (§25). */
 function normalizeError(err) {
   if (err?.code === 'GROQ_NOT_CONFIGURED' || err?.code === 'INVALID_CONVERSATION' || err?.code === 'EMPTY_AI_RESPONSE') return err
+  /* V1.1: exhausted tool-call retries → honest, readable reason. */
+  if (err?.code === 'AI_TOOL_USE_FAILED') {
+    const e = new Error('The AI provider repeatedly returned malformed tool calls after several retries. Please try the task again.')
+    e.code = 'AI_TOOL_USE_FAILED'; e.userSafe = true
+    return e
+  }
   const status = err?.status || err?.response?.status
   const normalized = new Error(err?.message || 'AI provider error')
   if (status === 401 || status === 403) { normalized.code = 'AI_AUTH'; normalized.status = status }
@@ -103,34 +119,105 @@ async function chatCompleteStream({ messages, model, maxTokens = 2048, temperatu
    Uses the provider's NATIVE structured tool-calling (OpenAI-
    compatible `tools` + `tool_choice` on Groq). The Agent loop
    never parses natural-language command text — every tool
-   request arrives as a structured tool_call object.            */
+   request arrives as a structured tool_call object.
+
+   V1.1 PRODUCTION FIX (reported 400 tool_use_failed):
+   Groq occasionally emits a tool_call whose arguments JSON is
+   malformed and rejects the whole generation with
+     400 {"code":"tool_use_failed",
+          "message":"Failed to parse tool call arguments as JSON",
+          "failed_generation":"{\"name\":… truncated …"}
+   The request itself is fine — only the sampled generation was
+   bad. We therefore RETRY the identical request a bounded number
+   of times (fresh sampling almost always produces valid JSON),
+   and on each retry we inject a short strict-JSON reminder so the
+   model converges instead of repeating the drift. Every attempt
+   is logged (redacted) for observability; after the final attempt
+   the coded error surfaces honestly to the caller.            */
+const { normalizeAssistantMessage } = require('../agent/toolCallRepair')
+
+const TOOL_CALL_RETRY_HINT = 'Reminder: when you call a tool, the arguments MUST be a single valid JSON object — complete, properly quoted, fully closed. Never truncate arguments.'
+
+function isToolUseFailure(err) {
+  if (err?.code === 'AI_TOOL_USE_FAILED') return true
+  const status = err?.status || err?.response?.status
+  const body = err?.error || err?.responseBody || err?.message || ''
+  return status === 400 && /tool_use_failed|parse tool call arguments/i.test(String(typeof body === 'string' ? body : JSON.stringify(body)))
+}
+
+function withToolCallRetry({ attempts = 3, backoffMs = 600, jitter = 400 } = {}) {
+  return async (attempt) => {
+    let lastErr = null
+    for (let i = 0; i < attempts; i++) {
+      try {
+        return await attempt(i, i > 0)
+      } catch (err) {
+        if (!isToolUseFailure(err)) throw err
+        lastErr = err
+        const failed = err?.failedGeneration || ''
+        console.warn(`[Agent] Groq tool_use_failed (attempt ${i + 1}/${attempts}): malformed tool-call arguments${failed ? ` — failed_generation (${String(failed).length} chars)` : ''}`)
+        if (i === attempts - 1) break
+        await new Promise(r => setTimeout(r, backoffMs + Math.random() * jitter))
+      }
+    }
+    throw lastErr
+  }
+}
+
 async function chatCompleteWithTools({ messages, tools, toolChoice = 'auto', model, maxTokens = 2048, temperature = 0.4, signal }) {
   const { signal: timed, cleanup } = withTimeout(signal, config.limits.chatTimeoutMs, 'Agent tool-calling')
+  const retry = withToolCallRetry({ attempts: Number(process.env.GROQ_TOOL_CALL_RETRIES) > 0 ? Number(process.env.GROQ_TOOL_CALL_RETRIES) : 3 })
   try {
-    const payload = {
-      model: model || config.models.chat,
-      messages,
-      max_tokens: maxTokens,
-      temperature,
-    }
-    if (tools?.length) {
-      payload.tools = tools
-      payload.tool_choice = toolChoice
-    }
-    const completion = await getClient().chat.completions.create(payload, { signal: timed })
-    const choice = completion.choices?.[0]
-    const message = choice?.message
-    if (!message) { const e = new Error('Empty AI response'); e.code = 'EMPTY_AI_RESPONSE'; throw e }
-    return {
-      message: {
-        role: 'assistant',
-        content: message.content ?? '',
-        tool_calls: message.tool_calls || [],
-      },
-      finish_reason: choice?.finish_reason || null,
-      model: completion.model || model || config.models.chat,
-      tokens: completion.usage?.total_tokens || null,
-    }
+    return await retry(async (attemptIndex, isRetry) => {
+      // On retries, append the strict-JSON reminder as the last system
+      // message — a bounded, targeted correction for the observed drift.
+      const payloadMessages = isRetry && messages.some(m => m.role === 'tool')
+        ? [...messages, { role: 'system', content: TOOL_CALL_RETRY_HINT }]
+        : messages
+      const payload = {
+        model: model || config.models.chat,
+        messages: payloadMessages,
+        max_tokens: maxTokens,
+        temperature,
+      }
+      if (tools?.length) {
+        payload.tools = tools
+        payload.tool_choice = toolChoice
+      }
+      let completion
+      try {
+        completion = await getClient().chat.completions.create(payload, { signal: timed })
+      } catch (err) {
+        // Attach the failed_generation for observability before normalize.
+        const status = err?.status || err?.response?.status
+        if (status === 400) {
+          const bodyText = err?.error ? (typeof err.error === 'string' ? err.error : JSON.stringify(err.error)) : (err?.message || '')
+          if (/tool_use_failed|parse tool call arguments/i.test(bodyText)) {
+            err.code = 'AI_TOOL_USE_FAILED'
+            try {
+              const parsed = JSON.parse(bodyText)
+              err.failedGeneration = parsed?.error?.failed_generation || null
+            } catch { err.failedGeneration = null }
+          }
+        }
+        throw err
+      }
+      const choice = completion.choices?.[0]
+      const message = choice?.message
+      if (!message) { const e = new Error('Empty AI response'); e.code = 'EMPTY_AI_RESPONSE'; throw e }
+      // Defensive normalisation: arguments are always a JSON STRING that
+      // parses, ids/names always present — downstream code sees one shape.
+      const normalized = normalizeAssistantMessage(message)
+      if (normalized.tool_calls.some(c => c._args_repaired)) {
+        console.warn('[Agent] repaired malformed tool-call arguments from a 200 response (truncated/malformed JSON)')
+      }
+      return {
+        message: normalized,
+        finish_reason: choice?.finish_reason || null,
+        model: completion.model || model || config.models.chat,
+        tokens: completion.usage?.total_tokens || null,
+      }
+    })
   } catch (err) { throw normalizeError(err) } finally { cleanup() }
 }
 
@@ -238,6 +325,7 @@ async function synthesizeSpeech({ text, signal }) {
 
 module.exports = {
   getClient,
+  setClientForTests,
   chatComplete,
   chatCompleteStream,
   chatCompleteWithTools,

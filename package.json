@@ -6,9 +6,12 @@
     "start": "node app.js",
     "dev": "nodemon app.js",
     "setup-admin": "node setup-admin.js",
-    "generate-vapid": "node generate-vapid.js"
+    "generate-vapid": "node generate-vapid.js",
+    "smoke:groq": "node scripts/groq-smoke.js",
+    "test:agent": "bash scripts/run-agent-tests.sh"
   },
   "dependencies": {
+    "archiver": "^7.0.1",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
@@ -25,6 +28,7 @@
     "web-push": "^3.6.7"
   },
   "devDependencies": {
+    "mongodb-memory-server": "^11.3.0",
     "node-test": "^1.4.6",
     "nodemon": "^3.1.0",
     "socket.io-client": "^4.8.4"

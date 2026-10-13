@@ -4,7 +4,10 @@ const bcrypt = require('bcryptjs')
 
 async function main() {
   const baseUri = process.env.MONGODB_URI || require('dotenv').config().parsed.MONGODB_URI
-  await mongoose.connect(`${baseUri}/kinyabot-agent-v1-smoke`)
+  // V1.1: DB name is parameterised so the same helper serves any stack
+  // (e2e-stack-v11 uses kinyabot-agent-v11-e2e via UI_USER_DB).
+  const dbName = process.env.UI_USER_DB || 'kinyabot-agent-v1-smoke'
+  await mongoose.connect(`${baseUri}/${dbName}`)
   const { User } = require('../models')
   await User.deleteOne({ username: 'uibot' })
   await User.create({

@@ -1,6 +1,8 @@
 /**
- * KinyaBot Agent V1 — Tool Layer Tests (§37)
- * read/write/edit/search/list/delete + project detection + git.
+ * KinyaBot Agent V1.1 — Tool Layer Tests (§37)
+ * read/write/edit/search/list/delete + project detection.
+ * V1.1 (§11): Git tools were REMOVED from the Agent registry — the
+ * tests below assert their absence so the removal cannot regress.
  * Run: NODE_ENV=test node --test tests/agent/tools.test.js
  */
 const test = require('node:test')
@@ -12,7 +14,6 @@ const registry = require('../../services/agent/tools/registry')
 require('../../services/agent/tools/filesystem')
 require('../../services/agent/tools/terminal')
 require('../../services/agent/tools/project').registerAll()
-require('../../services/agent/tools/git')
 
 const agentConfig = require('../../services/agent/config')
 const { Workspace } = require('../../services/agent/sandbox')
@@ -192,38 +193,19 @@ test('empty workspace is reported honestly as no project', async () => {
   await ws2.remove()
 })
 
-/* ── Git tools (§8) ──────────────────────────────────────────── */
-test('git tools report "not a repository" honestly in a fresh workspace', async () => {
-  const ws2 = new Workspace('gitless' + Date.now().toString(36))
-  await ws2.ensure()
-  const ctx2 = { ...ctx, workspace: ws2 }
-  const status = await registry.executeTool('git_status', {}, ctx2)
-  assert.equal(status.isRepository, false)
-  await ws2.remove()
+/* ── Git tools removed (V1.1 §11) ───────────────────────────── */
+test('git tools are no longer registered for the Agent', () => {
+  const names = registry.listTools().map(t => t.name)
+  assert.ok(!names.includes('git_status'), 'git_status must not be registered')
+  assert.ok(!names.includes('git_diff'), 'git_diff must not be registered')
+  assert.ok(!names.includes('git_log'), 'git_log must not be registered')
 })
 
-test('git tools read real repository state', async () => {
-  // init a real repo with one commit through the terminal tool path
-  const { runRealCommand } = require('../../services/agent/tools/terminal')
-  const { buildCommandEnv } = require('../../services/agent/sandbox')
-  await registry.executeTool('write_file', { path: 'committed.txt', content: 'tracked\n' }, ctx)
-  const init = await runRealCommand({ command: 'git init -q && git config user.email a@b.c && git config user.name T && git add -A && git commit -qm init', cwd: ws.root, env: buildCommandEnv(ws.root), timeoutMs: 20000, maxOutputBytes: 20000 })
-  assert.equal(init.exitCode, 0, `git init chain succeeded — stderr: ${init.stderr.slice(0, 200)}`)
-
-  const status = await registry.executeTool('git_status', {}, ctx)
-  assert.equal(status.isRepository, true)
-  assert.ok(status.branch)
-
-  const log = await registry.executeTool('git_log', {}, ctx)
-  assert.ok(log.commits.length >= 1)
-  assert.equal(log.commits[0].message, 'init')
-
-  // Modification of a TRACKED file → git_diff reports it
-  // (untracked files honestly never appear in git diff)
-  await registry.executeTool('write_file', { path: 'committed.txt', content: 'modified\n' }, ctx)
-  const diff = await registry.executeTool('git_diff', {}, ctx)
-  assert.equal(diff.empty, false)
-  assert.ok(diff.diff.includes('committed.txt'))
+test('run_command still executes git through command safety (not a tool)', async () => {
+  // Git remains reachable via run_command with the SAME safety net.
+  const { classifyCommand } = require('../../services/agent/commandSafety')
+  assert.equal(classifyCommand('git status').risk, 'low')
+  assert.equal(classifyCommand('git push origin main').risk, 'high')
 })
 
 test.after(async () => {

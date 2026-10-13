@@ -57,15 +57,22 @@ const crypto = require('crypto')
 const fs = require('fs')
 const fsp = fs.promises
 
-/* Tool registration happens on import. */
+/* Tool registration happens on import.
+   V1.1 (§11): the read-only Git tools (git_status/git_diff/git_log) were
+   REMOVED from the Agent-facing registry — they are not required for the
+   V1 execution experience and removing them shrinks the tool surface the
+   model must call correctly (fewer malformed-tool-call failure modes).
+   Git commands remain available through run_command with the same command
+   safety classification — nothing about Git usage elsewhere in KinyaBot
+   is affected.                                                              */
 require('./tools/filesystem')
 require('./tools/terminal')
 require('./tools/project').registerAll()
-require('./tools/git')
 
 const registry = require('./tools/registry')
 const agentProviderModule = require('./agentProvider')
 const contextManager = require('./contextManager')
+const { parseToolCallArguments } = require('./toolCallRepair')
 const { Workspace } = require('./sandbox')
 const { runRealCommand } = require('./tools/terminal')
 const { scanProject } = require('./tools/project')
@@ -315,9 +322,19 @@ async function runTask(t, l) {
 /* ── Tool call with retry + honest error returns (§18) ───────── */
 async function executeToolCall(call) {
   const name = call.function?.name
-  let args
-  try { args = JSON.parse(call.function?.arguments || '{}') }
-  catch { return JSON.stringify({ error: 'TOOL_INVALID_ARGS', message: 'Arguments were not valid JSON.' }) }
+  /* V1.1: arguments are normalized+repaired upstream (provider) but this
+     is the last line of defense — a scripted or future provider may still
+     hand us raw malformed JSON. Repair is conservative: it only closes
+     what the model left open, never invents content.                    */
+  const parsed = parseToolCallArguments(call.function?.arguments ?? '{}')
+  if (!parsed.ok) {
+    stats.retries += 1
+    return JSON.stringify({
+      error: 'TOOL_INVALID_ARGS',
+      message: 'Arguments were not valid JSON. Call the tool again with a single complete JSON object as arguments.',
+    })
+  }
+  const args = parsed.value
 
   emit('tool_started', { name, args })
   stats.tool_calls += 1

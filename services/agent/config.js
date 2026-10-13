@@ -100,11 +100,13 @@ const config = {
     allowedHosts: ['127.0.0.1', 'localhost', '::1'],
   },
 
-  /* ── Permissions granted to a V1 task (§21).
-     NETWORK / BROWSER are architected but intentionally NOT
+  /* ── Permissions granted to a V1.1 task (§21).
+     NETWORK / BROWSER / GIT are architected but intentionally NOT
      granted — tools requiring them are rejected with a clear
-     error so future versions can flip them on safely.           */
-  defaultPermissions: { READ: true, WRITE: true, EXECUTE: true, GIT: true, NETWORK: false, BROWSER: false },
+     error so future versions can flip them on safely. (V1.1 §11:
+     the Git tools were removed from the Agent registry; git usage
+     flows through run_command + command safety instead.)        */
+  defaultPermissions: { READ: true, WRITE: true, EXECUTE: true, GIT: false, NETWORK: false, BROWSER: false },
 
   /* ── Rate limiting burst guard (mirrors services/rateLimiter) ── */
   rateLimits: {
