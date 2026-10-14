@@ -454,6 +454,8 @@ function friendlyAgentError(payload) {
   if (code === 'GROQ_NOT_CONFIGURED') return 'The AI provider is not configured (GROQ_API_KEY missing).'
   if (code === 'AI_RATE_LIMIT') return 'The AI provider rate limit was hit. Please retry the task in a moment.'
   if (code === 'AI_MODEL_UNAVAILABLE') return 'The configured agent model is unavailable (GROQ_AGENT_MODEL).'
+  if (code === 'AI_OUTPUT_PARSE_FAILED') return payload.error || 'The AI provider could not format a tool response after retries. Please try the task again.'
+  if (code === 'AI_TOOL_USE_FAILED') return payload.error || 'The AI provider repeatedly returned malformed tool calls. Please try the task again.'
   if (code === 'AI_TIMEOUT') return 'The AI provider timed out.'
   if (code === 'TASK_TIMEOUT') return payload.error || 'The task exceeded its maximum duration.'
   if (code === 'STEP_LIMIT') return payload.error || 'The task reached its maximum number of steps.'

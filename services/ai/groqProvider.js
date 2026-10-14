@@ -52,6 +52,11 @@ function normalizeError(err) {
     e.code = 'AI_TOOL_USE_FAILED'; e.userSafe = true
     return e
   }
+  if (err?.code === 'AI_OUTPUT_PARSE_FAILED') {
+    const e = new Error('The AI provider could not format a tool response after several retries. Please try the task again.')
+    e.code = 'AI_OUTPUT_PARSE_FAILED'; e.userSafe = true
+    return e
+  }
   const status = err?.status || err?.response?.status
   const normalized = new Error(err?.message || 'AI provider error')
   if (status === 401 || status === 403) { normalized.code = 'AI_AUTH'; normalized.status = status }
@@ -121,7 +126,7 @@ async function chatCompleteStream({ messages, model, maxTokens = 2048, temperatu
    never parses natural-language command text — every tool
    request arrives as a structured tool_call object.
 
-   V1.1 PRODUCTION FIX (reported 400 tool_use_failed):
+   Groq may return 400 tool_use_failed or output_parse_failed:
    Groq occasionally emits a tool_call whose arguments JSON is
    malformed and rejects the whole generation with
      400 {"code":"tool_use_failed",
@@ -129,20 +134,20 @@ async function chatCompleteStream({ messages, model, maxTokens = 2048, temperatu
           "failed_generation":"{\"name\":… truncated …"}
    The request itself is fine — only the sampled generation was
    bad. We therefore RETRY the identical request a bounded number
-   of times (fresh sampling almost always produces valid JSON),
+   of times (fresh sampling often produces a valid response),
    and on each retry we inject a short strict-JSON reminder so the
    model converges instead of repeating the drift. Every attempt
-   is logged (redacted) for observability; after the final attempt
+   is    logged without generated content for observability; after the final attempt
    the coded error surfaces honestly to the caller.            */
 const { normalizeAssistantMessage } = require('../agent/toolCallRepair')
 
 const TOOL_CALL_RETRY_HINT = 'Reminder: when you call a tool, the arguments MUST be a single valid JSON object — complete, properly quoted, fully closed. Never truncate arguments.'
 
 function isToolUseFailure(err) {
-  if (err?.code === 'AI_TOOL_USE_FAILED') return true
+  if (['AI_TOOL_USE_FAILED', 'AI_OUTPUT_PARSE_FAILED'].includes(err?.code)) return true
   const status = err?.status || err?.response?.status
   const body = err?.error || err?.responseBody || err?.message || ''
-  return status === 400 && /tool_use_failed|parse tool call arguments/i.test(String(typeof body === 'string' ? body : JSON.stringify(body)))
+  return status === 400 && /tool_use_failed|output_parse_failed|parse tool call arguments/i.test(String(typeof body === 'string' ? body : JSON.stringify(body)))
 }
 
 function withToolCallRetry({ attempts = 3, backoffMs = 600, jitter = 400 } = {}) {
@@ -155,7 +160,7 @@ function withToolCallRetry({ attempts = 3, backoffMs = 600, jitter = 400 } = {})
         if (!isToolUseFailure(err)) throw err
         lastErr = err
         const failed = err?.failedGeneration || ''
-        console.warn(`[Agent] Groq tool_use_failed (attempt ${i + 1}/${attempts}): malformed tool-call arguments${failed ? ` — failed_generation (${String(failed).length} chars)` : ''}`)
+        console.warn(`[Agent] Groq generated-output parse failure (attempt ${i + 1}/${attempts})${failed ? ` — failed_generation (${String(failed).length} chars)` : ''}`)
         if (i === attempts - 1) break
         await new Promise(r => setTimeout(r, backoffMs + Math.random() * jitter))
       }
@@ -169,10 +174,13 @@ async function chatCompleteWithTools({ messages, tools, toolChoice = 'auto', mod
   const retry = withToolCallRetry({ attempts: Number(process.env.GROQ_TOOL_CALL_RETRIES) > 0 ? Number(process.env.GROQ_TOOL_CALL_RETRIES) : 3 })
   try {
     return await retry(async (attemptIndex, isRetry) => {
-      // On retries, append the strict-JSON reminder as the last system
-      // message — a bounded, targeted correction for the observed drift.
-      const payloadMessages = isRetry && messages.some(m => m.role === 'tool')
-        ? [...messages, { role: 'system', content: TOOL_CALL_RETRY_HINT }]
+      // A parse failure can happen on the first tool call, before there
+      // is a tool result in the conversation. Put the reminder in the
+      // system prompt for every retry that includes tools.
+      const payloadMessages = isRetry && tools?.length
+        ? messages.map((message, index) => index === 0 && message.role === 'system'
+          ? { ...message, content: `${message.content}\n\n${TOOL_CALL_RETRY_HINT}` }
+          : message)
         : messages
       const payload = {
         model: model || config.models.chat,
@@ -191,12 +199,15 @@ async function chatCompleteWithTools({ messages, tools, toolChoice = 'auto', mod
         // Attach the failed_generation for observability before normalize.
         const status = err?.status || err?.response?.status
         if (status === 400) {
-          const bodyText = err?.error ? (typeof err.error === 'string' ? err.error : JSON.stringify(err.error)) : (err?.message || '')
-          if (/tool_use_failed|parse tool call arguments/i.test(bodyText)) {
-            err.code = 'AI_TOOL_USE_FAILED'
+          const bodyText = [err?.error, err?.responseBody, err?.message, err?.code]
+            .filter(Boolean)
+            .map(value => typeof value === 'string' ? value : JSON.stringify(value))
+            .join(' ')
+          if (/tool_use_failed|output_parse_failed|parse tool call arguments/i.test(bodyText)) {
+            err.code = /output_parse_failed/i.test(bodyText) ? 'AI_OUTPUT_PARSE_FAILED' : 'AI_TOOL_USE_FAILED'
             try {
-              const parsed = JSON.parse(bodyText)
-              err.failedGeneration = parsed?.error?.failed_generation || null
+              const body = err?.error && typeof err.error === 'object' ? err.error : JSON.parse(bodyText)
+              err.failedGeneration = body?.error?.failed_generation || body?.failed_generation || null
             } catch { err.failedGeneration = null }
           }
         }

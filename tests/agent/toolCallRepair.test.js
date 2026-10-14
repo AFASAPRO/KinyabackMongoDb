@@ -193,6 +193,52 @@ test('chatCompleteWithTools retries a tool_use_failed 400 and succeeds', async (
   }
 })
 
+test('chatCompleteWithTools retries Groq output_parse_failed before the first tool call', async () => {
+  const groqProvider = require('../../services/ai/groqProvider')
+  let calls = 0
+  let retrySystemPrompt = ''
+  const fakeClient = {
+    chat: {
+      completions: {
+        create: async (payload) => {
+          calls += 1
+          if (calls === 1) {
+            const body = { error: { message: "Parsing failed. The model generated output that could not be parsed.", type: 'invalid_request_error', code: 'output_parse_failed', failed_generation: '' } }
+            const err = new Error(`400 ${body.error.message}`)
+            err.status = 400
+            err.error = body.error
+            throw err
+          }
+          retrySystemPrompt = payload.messages[0].content
+          return {
+            model: payload.model,
+            choices: [{
+              finish_reason: 'tool_calls',
+              message: { role: 'assistant', content: '', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read_file', arguments: '{"path":"a.js"}' } }] },
+            }],
+          }
+        },
+      },
+    },
+  }
+  groqProvider.setClientForTests(fakeClient)
+  process.env.GROQ_TOOL_CALL_RETRIES = '2'
+
+  try {
+    const result = await groqProvider.chatCompleteWithTools({
+      messages: [{ role: 'system', content: 'Call tools to complete the task.' }, { role: 'user', content: 'Inspect the project.' }],
+      tools: [{ type: 'function', function: { name: 'read_file', parameters: { type: 'object', properties: {} } } }],
+      model: 'test-model',
+    })
+    assert.equal(calls, 2, 'the parse failure is retried once')
+    assert.match(retrySystemPrompt, /arguments MUST be a single valid JSON object/)
+    assert.equal(result.message.tool_calls[0].function.name, 'read_file')
+  } finally {
+    groqProvider.setClientForTests(null)
+    delete process.env.GROQ_TOOL_CALL_RETRIES
+  }
+})
+
 test('chatCompleteWithTools gives up after the retry budget and codes the error', async () => {
   const groqProvider = require('../../services/ai/groqProvider')
   let calls = 0
