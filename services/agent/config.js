@@ -29,16 +29,21 @@ function bool(name, fallback) {
 
 const agentModel = env('GROQ_AGENT_MODEL', env('GROQ_CHAT_MODEL', env('GROQ_MODEL', 'llama-3.3-70b-versatile')))
 
-/* V1.2 (§8): vision-capable model for reference-image understanding.
-   Groq's llama-4 family accepts image input; configured separately so
-   deployments without vision keep working (capability reported
-   honestly via /agent/config — never pretend a text model saw an
-   image). Fallback chain lets a single GROQ_VISION_MODEL cover both. */
-const visionModel = env('GROQ_AGENT_VISION_MODEL', env('GROQ_VISION_MODEL', 'meta-llama/llama-4-scout-17b-16e-instruct'))
+/* V1.2 (§8): route reference images only to an image-capable model.
+   Capability is reported honestly by /agent/config. */
 const VISION_CAPABLE_PATTERNS = [/llama-4/i, /llama-3\.2-\d+b-vision/i, /vision/i, /gemma-3/i, /qwen.*vl/i, /pixtral/i]
 function isVisionCapable(model) {
   return VISION_CAPABLE_PATTERNS.some(re => re.test(String(model || '')))
 }
+
+/* Ignore stale text-only overrides and use the best configured vision model. */
+const visionCandidates = [
+  env('GROQ_AGENT_VISION_MODEL'),
+  env('GROQ_VISION_MODEL'),
+  isVisionCapable(agentModel) ? agentModel : null,
+  'meta-llama/llama-4-scout-17b-16e-instruct',
+]
+const visionModel = visionCandidates.find(isVisionCapable) || null
 
 const config = {
   /* ── Master switch — lets hosting environments without a suitable
