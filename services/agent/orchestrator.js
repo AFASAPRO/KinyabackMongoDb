@@ -322,8 +322,13 @@ async function finalizeTask(taskDoc, task, payload) {
       completed_at: completedAt,
       error: payload.userSafe ? payload.error : friendlyAgentError(payload),
       error_code: payload.code || 'AGENT_ERROR',
+      rate_limit_reset_at: payload.code === 'AI_RATE_LIMIT' ? payload.rateLimitResetAt || null : null,
     })
-    await emitAndPersist(taskDoc, 'task_failed', { error: payload.userSafe ? payload.error : friendlyAgentError(payload), code: payload.code })
+    await emitAndPersist(taskDoc, 'task_failed', {
+      error: payload.userSafe ? payload.error : friendlyAgentError(payload),
+      code: payload.code,
+      rateLimitResetAt: payload.code === 'AI_RATE_LIMIT' ? payload.rateLimitResetAt || null : null,
+    })
     await mirrorResultToConversation(taskDoc, payload)
   }
 
@@ -452,7 +457,25 @@ function friendlyAgentError(payload) {
   const code = payload.code
   if (code === 'AI_AUTH') return 'The AI provider rejected the configured credentials (AI_AUTH). Check GROQ_API_KEY.'
   if (code === 'GROQ_NOT_CONFIGURED') return 'The AI provider is not configured (GROQ_API_KEY missing).'
-  if (code === 'AI_RATE_LIMIT') return 'The AI provider rate limit was hit. Please retry the task in a moment.'
+  if (code === 'AI_RATE_LIMIT') {
+    const resetTime = Date.parse(payload.rateLimitResetAt || '')
+    if (!Number.isFinite(resetTime) || resetTime <= Date.now()) {
+      return "You've reached the AI provider's usage limit. The provider didn't include a reset time, so please try again later."
+    }
+    const remainingMs = resetTime - Date.now()
+    const totalMinutes = Math.ceil(remainingMs / 60_000)
+    const duration = totalMinutes < 60
+      ? `about ${totalMinutes} ${totalMinutes === 1 ? 'minute' : 'minutes'}`
+      : totalMinutes < 24 * 60
+        ? `about ${Math.floor(totalMinutes / 60)} ${Math.floor(totalMinutes / 60) === 1 ? 'hour' : 'hours'}${totalMinutes % 60 ? ` and ${totalMinutes % 60} minutes` : ''}`
+        : `about ${Math.floor(totalMinutes / (24 * 60))} ${Math.floor(totalMinutes / (24 * 60)) === 1 ? 'day' : 'days'}`
+    const resetClock = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'UTC',
+      hour: 'numeric',
+      minute: '2-digit',
+    }).format(resetTime)
+    return `You've reached the AI provider's usage limit. It resets in ${duration} (around ${resetClock} UTC). Please try again then.`
+  }
   if (code === 'AI_MODEL_UNAVAILABLE') return 'The configured agent model is unavailable (GROQ_AGENT_MODEL).'
   if (code === 'AI_OUTPUT_PARSE_FAILED') return payload.error || 'The AI provider could not format a tool response after retries. Please try the task again.'
   if (code === 'AI_TOOL_USE_FAILED') return payload.error || 'The AI provider repeatedly returned malformed tool calls. Please try the task again.'
@@ -484,10 +507,11 @@ async function mirrorResultToConversation(taskDoc, payload) {
     }
 
     if (!payload.ok) {
+      const rateLimited = payload.code === 'AI_RATE_LIMIT'
       const failed = await Message.create({
         chat_id: chat._id,
         role: 'assistant',
-        content: `**Agent task failed.**\n\n\`${payload.code || 'AGENT_ERROR'}\` — ${payload.userSafe ? payload.error : friendlyAgentError(payload)}`,
+        content: `**${rateLimited ? 'AI usage limit reached' : 'Agent task failed'}**\n\n${payload.userSafe ? payload.error : friendlyAgentError(payload)}`,
         agent_task_id: taskDoc._id.toString(),
         model: 'agent',
         provider: 'kinyabot-agent',

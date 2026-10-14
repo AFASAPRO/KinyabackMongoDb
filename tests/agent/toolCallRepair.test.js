@@ -298,3 +298,30 @@ test('non-tool-use 400 errors are NOT retried', async () => {
     groqProvider.setClientForTests(null)
   }
 })
+
+test('rate-limit reset headers are converted to a reset timestamp', () => {
+  const groqProvider = require('../../services/ai/groqProvider')
+  const now = Date.parse('2026-10-14T12:00:00.000Z')
+
+  assert.equal(
+    groqProvider.rateLimitResetAt(new Headers({ 'x-ratelimit-reset-requests': '2h30m' }), now),
+    '2026-10-14T14:30:00.000Z',
+  )
+  assert.equal(
+    groqProvider.rateLimitResetAt(new Headers({ 'retry-after': '120' }), now),
+    '2026-10-14T12:02:00.000Z',
+  )
+  assert.equal(groqProvider.rateLimitResetAt(new Headers(), now), null)
+})
+
+test('normalized rate-limit errors preserve the provider reset time', () => {
+  const groqProvider = require('../../services/ai/groqProvider')
+  const now = Date.now()
+  const error = new Error('Too many requests')
+  error.status = 429
+  error.headers = new Headers({ 'x-ratelimit-reset-requests': '5s' })
+
+  const normalized = groqProvider.normalizeError(error)
+  assert.equal(normalized.code, 'AI_RATE_LIMIT')
+  assert.ok(Math.abs(Date.parse(normalized.rateLimitResetAt) - (now + 5000)) < 1000)
+})

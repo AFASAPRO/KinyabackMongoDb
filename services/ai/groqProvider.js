@@ -42,6 +42,43 @@ function setClientForTests(fake) {
   if (!fake) client = null
 }
 
+function getHeader(headers, name) {
+  if (!headers) return null
+  if (typeof headers.get === 'function') return headers.get(name)
+  const key = Object.keys(headers).find(k => k.toLowerCase() === name.toLowerCase())
+  return key ? headers[key] : null
+}
+
+function parseDurationMs(value) {
+  const text = String(value || '').trim().toLowerCase()
+  if (!text) return null
+  const matches = [...text.matchAll(/(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)/g)]
+  if (!matches.length || matches.map(m => m[0]).join('').replace(/\s/g, '') !== text.replace(/\s/g, '')) return null
+  const factors = { ms: 1, s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }
+  const duration = matches.reduce((sum, match) => sum + Number(match[1]) * factors[match[2]], 0)
+  return Number.isFinite(duration) && duration > 0 ? duration : null
+}
+
+function rateLimitResetAt(headers, now = Date.now()) {
+  const reset = getHeader(headers, 'x-ratelimit-reset-requests')
+  const resetMs = parseDurationMs(reset)
+  if (resetMs && resetMs <= 30 * 24 * 60 * 60 * 1000) return new Date(now + resetMs).toISOString()
+
+  const retryAfterMs = Number(getHeader(headers, 'retry-after-ms'))
+  if (Number.isFinite(retryAfterMs) && retryAfterMs > 0 && retryAfterMs <= 30 * 24 * 60 * 60 * 1000) {
+    return new Date(now + retryAfterMs).toISOString()
+  }
+
+  const retryAfter = String(getHeader(headers, 'retry-after') || '').trim()
+  const seconds = Number(retryAfter)
+  if (retryAfter && Number.isFinite(seconds) && seconds > 0 && seconds <= 30 * 24 * 60 * 60) {
+    return new Date(now + seconds * 1000).toISOString()
+  }
+  const date = Date.parse(retryAfter)
+  if (Number.isFinite(date) && date > now && date <= now + 30 * 24 * 60 * 60 * 1000) return new Date(date).toISOString()
+  return null
+}
+
 /* Normalize provider errors into coded errors the API layer can
    translate into honest, user-facing messages (§25). */
 function normalizeError(err) {
@@ -61,7 +98,11 @@ function normalizeError(err) {
   const normalized = new Error(err?.message || 'AI provider error')
   if (status === 401 || status === 403) { normalized.code = 'AI_AUTH'; normalized.status = status }
   else if (status === 404) { normalized.code = 'AI_MODEL_UNAVAILABLE'; normalized.status = status }
-  else if (status === 429) { normalized.code = 'AI_RATE_LIMIT'; normalized.status = status }
+  else if (status === 429) {
+    normalized.code = 'AI_RATE_LIMIT'
+    normalized.status = status
+    normalized.rateLimitResetAt = rateLimitResetAt(err?.headers)
+  }
   else if (err?.name === 'AbortError') { normalized.code = 'AI_TIMEOUT' }
   else normalized.code = err?.code || 'AI_PROVIDER_ERROR'
   return normalized
@@ -344,5 +385,6 @@ module.exports = {
   transcribeAudio,
   synthesizeSpeech,
   normalizeError,
+  rateLimitResetAt,
   DEFAULT_MODEL: config.models.chat,
 }

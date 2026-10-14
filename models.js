@@ -507,6 +507,7 @@ const agentTaskSchema = new Schema({
   permissions:     { type: Object, default: null },           // granted permission map
   error:           { type: String, default: null },
   error_code:      { type: String, default: null },
+  rate_limit_reset_at: { type: Date, default: null },
   result:          { type: String, default: null },           // final summary (also mirrored to a Message)
   stats: {
     steps:         { type: Number, default: 0 },

@@ -522,6 +522,7 @@ process.on('message', (msg) => {
         ok: false,
         error: err?.userSafe ? err.message : (err?.message || 'The agent task failed.'),
         code: err?.code || 'AGENT_ERROR',
+        rateLimitResetAt: err?.rateLimitResetAt || null,
         userSafe: !!err?.userSafe,
         stats: { ...stats },
       }))
