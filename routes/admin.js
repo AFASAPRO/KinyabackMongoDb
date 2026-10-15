@@ -24,6 +24,7 @@ const {
   User, Chat, Message, Admin, Notification, AdminNotification, AuditLog,
   SecurityEvent, PageView, SystemLog, UserMemory, KnowledgeBase,
   UsageTracking, UserPlan, FlaggedContent, PlanConfig, UsageDaily, PlanRequest,
+  EnterpriseRequest,
   SearchLog,
 } = require('../models')
 
@@ -1240,10 +1241,77 @@ router.put('/settings', async (req, res) => {
   } catch { res.status(500).json({ error: 'Failed to save settings' }) }
 })
 
-/* Admin accounts (single role: super_admin) */
+/* Admin accounts (single role: super_admin)
+   The superadmin can CREATE additional administrative users and
+   UPDATE their credentials (username / email / password) here.
+   Every mutation is audit-logged; passwords are never stored in
+   plaintext and never returned by any endpoint.                  */
 router.get('/admins', async (req, res) => {
   try { res.json((await Admin.find().select('username email role created_at last_login').sort({ created_at: 1 }).lean()).map(fmtDoc)) }
   catch { res.json([]) }
+})
+
+router.post('/admins', async (req, res) => {
+  const { username, email, password } = req.body || {}
+  const errors = {}
+  const uname = String(username || '').trim()
+  if (uname.length < 3 || uname.length > 40) errors.username = 'Username must be 3–40 characters.'
+  const uemail = String(email || '').trim().toLowerCase()
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(uemail) || uemail.length > 200) errors.email = 'Please enter a valid email address.'
+  const pass = String(password || '')
+  if (pass.length < 8 || pass.length > 128) errors.password = 'Password must be at least 8 characters.'
+  if (Object.keys(errors).length) return res.status(400).json({ error: 'Please fix the highlighted fields.', fields: errors })
+  try {
+    const existing = await Admin.findOne({ $or: [{ email: uemail }, { username: uname }] })
+    if (existing) return res.status(409).json({ error: existing.email === uemail ? 'That email already has an admin account' : 'That username is already taken' })
+    const hash = await bcrypt.hash(pass, 12)
+    const adm = await Admin.create({ username: uname, email: uemail, password_hash: hash, role: 'super_admin' })
+    await writeAudit(req.admin, 'admin.create', {
+      resourceType: 'admin', resourceId: adm._id.toString(), resourceLabel: uname,
+      meta: { email: uemail, role: 'super_admin' }, req,
+    })
+    await sysLog('info', 'admin', `Superadmin ${req.admin.username} created administrative user: ${uname}`)
+    res.status(201).json({ admin: { id: adm._id.toString(), username: adm.username, email: adm.email, role: adm.role, created_at: adm.created_at, last_login: null } })
+  } catch (err) { console.error('[AdminCreate]', err); res.status(500).json({ error: 'Could not create the administrative user' }) }
+})
+
+router.put('/admins/:id', async (req, res) => {
+  try {
+    const adm = await Admin.findById(req.params.id)
+    if (!adm) return res.status(404).json({ error: 'Administrative user not found' })
+    const b = req.body || {}
+    const errors = {}
+    const patch = {}
+
+    if (b.username !== undefined) {
+      const uname = String(b.username).trim()
+      if (uname.length < 3 || uname.length > 40) errors.username = 'Username must be 3–40 characters.'
+      else if (uname !== adm.username && await Admin.findOne({ username: uname })) errors.username = 'That username is already taken'
+      else patch.username = uname
+    }
+    if (b.email !== undefined) {
+      const uemail = String(b.email).trim().toLowerCase()
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(uemail) || uemail.length > 200) errors.email = 'Please enter a valid email address.'
+      else if (uemail !== adm.email && await Admin.findOne({ email: uemail })) errors.email = 'That email already has an admin account'
+      else patch.email = uemail
+    }
+    if (b.password !== undefined && b.password !== '') {
+      const pass = String(b.password)
+      if (pass.length < 8 || pass.length > 128) errors.password = 'Password must be at least 8 characters.'
+      else patch.password_hash = await bcrypt.hash(pass, 12)
+    }
+    if (Object.keys(errors).length) return res.status(400).json({ error: 'Please fix the highlighted fields.', fields: errors })
+    if (!Object.keys(patch).length) return res.status(400).json({ error: 'Nothing to update' })
+
+    Object.assign(adm, patch)
+    await adm.save()
+    await writeAudit(req.admin, 'admin.update', {
+      resourceType: 'admin', resourceId: adm._id.toString(), resourceLabel: adm.username,
+      meta: { changed: Object.keys(patch).filter(k => k !== 'password_hash').concat(patch.password_hash ? ['password'] : []) }, req,
+    })
+    await sysLog('info', 'admin', `Superadmin ${req.admin.username} updated administrative user: ${adm.username}`)
+    res.json({ admin: { id: adm._id.toString(), username: adm.username, email: adm.email, role: adm.role, created_at: adm.created_at, last_login: adm.last_login } })
+  } catch (err) { console.error('[AdminUpdate]', err); res.status(500).json({ error: 'Could not update the administrative user' }) }
 })
 
 router.delete('/admins/:id', async (req, res) => {
@@ -1658,6 +1726,50 @@ router.post('/plan-requests/:id/reject', async (req, res) => {
 
     res.json({ request: fmtPlanRequest(request) })
   } catch (err) { console.error('[PlanReject]', err); res.status(500).json({ error: 'Could not reject the request' }) }
+})
+
+/* ════════════════════════════════════════════════════════════════
+   ENTERPRISE REQUESTS — submitted from the landing-page pricing
+   popup by visitors WITHOUT an account. The superadmin reviews the
+   contact details here and moves each row through its lifecycle.
+════════════════════════════════════════════════════════════════ */
+router.get('/enterprise-requests', async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1)
+    const limit = Math.min(50, Math.max(5, parseInt(req.query.limit) || 20))
+    const status = ['pending', 'contacted', 'closed'].includes(req.query.status) ? req.query.status : null
+    const filter = status ? { status } : {}
+    const [docs, total, counts] = await Promise.all([
+      EnterpriseRequest.find(filter).sort({ created_at: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+      EnterpriseRequest.countDocuments(filter),
+      EnterpriseRequest.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]),
+    ])
+    const by = Object.fromEntries(counts.map(c => [c._id, c.count]))
+    res.json({
+      items: docs.map(fmtDoc),
+      total, page, pages: Math.ceil(total / limit) || 1,
+      counts: { pending: by.pending || 0, contacted: by.contacted || 0, closed: by.closed || 0, all: counts.reduce((a, c) => a + c.count, 0) },
+    })
+  } catch (err) { console.error('[EnterpriseRequests]', err); res.status(500).json({ error: 'Could not load enterprise requests' }) }
+})
+
+router.put('/enterprise-requests/:id/status', async (req, res) => {
+  const { status } = req.body || {}
+  if (!['pending', 'contacted', 'closed'].includes(status)) return res.status(400).json({ error: 'Invalid status' })
+  try {
+    const doc = await EnterpriseRequest.findById(req.params.id)
+    if (!doc) return res.status(404).json({ error: 'Enterprise request not found' })
+    doc.status = status
+    doc.handled_at = new Date()
+    doc.handled_by = req.admin.username
+    if (typeof req.body?.note === 'string') doc.handled_note = req.body.note.slice(0, 500)
+    await doc.save()
+    await writeAudit(req.admin, 'enterprise_request.status', {
+      resourceType: 'enterprise_request', resourceId: doc._id.toString(),
+      resourceLabel: `${doc.full_name} · ${doc.company}`, meta: { status }, req,
+    })
+    res.json({ request: fmtDoc(doc) })
+  } catch (err) { console.error('[EnterpriseStatus]', err); res.status(500).json({ error: 'Could not update the request' }) }
 })
 
 /* ── Plan configuration (§2 — SuperAdmin edits limits/flags live) ── */

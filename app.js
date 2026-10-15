@@ -2218,6 +2218,11 @@ app.get('/api/usage', authGuard, async (req, res) => {
 ════════════════════════════════════════════════════════════ */
 app.use('/api', require('./routes/subscription'));
 
+/* ═══ ENTERPRISE REQUESTS (public, landing-page pricing popup) ═══
+   Visitors WITHOUT a KinyaBot account can request the Enterprise
+   plan; every submission lands in Superadmin → Enterprise Requests. */
+app.use('/api', require('./routes/enterprise'));
+
 /* ═══ V1.2 §12 — USER NOTIFICATIONS + WEB PUSH ═════════════════
    Persistent per-user notifications (history, read state, deep
    links, dedupe) + Web Push subscription management. Mounted on

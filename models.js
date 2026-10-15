@@ -642,6 +642,28 @@ userNotificationSchema.index({ user_id: 1, dismissed: 1, created_at: -1 });
 userNotificationSchema.index({ user_id: 1, read: 1, created_at: -1 });
 userNotificationSchema.index({ user_id: 1, kind: 1, dedupe_key: 1 }, { unique: true, sparse: true });
 
+/* ── ENTERPRISE REQUEST (from the landing-page pricing popup) ────
+   A visitor WITHOUT an account can request the Enterprise plan.
+   The superadmin sees every row in Superadmin → Enterprise Requests
+   and moves it through pending → contacted → closed.               */
+const enterpriseRequestSchema = new Schema({
+  full_name:  { type: String, required: true, trim: true, maxlength: 120 },
+  company:    { type: String, required: true, trim: true, maxlength: 160 },
+  email:      { type: String, required: true, lowercase: true, trim: true, maxlength: 200 },
+  phone:      { type: String, required: true, trim: true, maxlength: 40 },
+  team_size:  { type: String, default: '', maxlength: 40 },
+  message:    { type: String, default: '', maxlength: 1000 },
+  source:     { type: String, default: 'landing_pricing', maxlength: 60 },
+  status:     { type: String, enum: ['pending', 'contacted', 'closed'], default: 'pending', index: true },
+  // Review trail
+  handled_at:  { type: Date, default: null },
+  handled_by:  { type: String, default: null },   // admin username
+  handled_note:{ type: String, default: null, maxlength: 500 },
+}, { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } });
+
+enterpriseRequestSchema.index({ status: 1, created_at: -1 });
+enterpriseRequestSchema.index({ email: 1, created_at: -1 });
+
 /* ── EXPORTS ──────────────────────────────────────────────────── */
 module.exports = {
   User:              mongoose.model('User',              userSchema),
@@ -664,6 +686,7 @@ module.exports = {
   PlanConfig:        mongoose.model('PlanConfig',        planConfigSchema),
   UsageDaily:        mongoose.model('UsageDaily',        usageDailySchema),
   PlanRequest:       mongoose.model('PlanRequest',       planRequestSchema),
+  EnterpriseRequest: mongoose.model('EnterpriseRequest', enterpriseRequestSchema),
   FlaggedContent:    mongoose.model('FlaggedContent',    flaggedContentSchema),
   SearchLog:         mongoose.model('SearchLog',         searchLogSchema),
   AgentTask:         mongoose.model('AgentTask',         agentTaskSchema),

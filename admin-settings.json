@@ -22,7 +22,7 @@
   "web_search_allowed_domains": [],
   "web_search_blocked_domains": [],
   "agent_enabled": true,
-  "agent_max_concurrent": 2,
+  "agent_max_concurrent": 3,
   "agent_task_timeout_ms": 900000,
   "agent_command_timeout_ms": 120000,
   "agent_daily_limit": 30,
